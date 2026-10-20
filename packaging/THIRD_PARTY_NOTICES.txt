@@ -1,0 +1,26 @@
+Third-party software in RLUtils
+================================
+
+RLUtils is built with the components below. Their license texts are in the "licenses" folder next to
+this file.
+
+Qt for Python (PySide6, Shiboken6) and Qt 6, including Qt WebEngine
+  License: GNU Lesser General Public License v3 (LGPL-3.0), see licenses\LGPL-3.0.txt and
+  licenses\GPL-3.0.txt (the LGPL is a set of additional permissions on top of the GPL).
+  Copyright (C) The Qt Company Ltd. and other contributors.
+  Source code: https://code.qt.io/ (Qt) and https://code.qt.io/cgit/pyside/pyside-setup.git/ (PySide6).
+  The Qt and PySide6 libraries are shipped as separate files (the _internal\PySide6 folder), unmodified, so
+  you can replace them with your own builds of the same versions.
+  Qt WebEngine contains Chromium and its third-party components; their licenses are listed at
+  https://doc.qt.io/qt-6/qtwebengine-licensing.html
+
+Python
+  License: Python Software Foundation License, see licenses\Python-PSF.txt.
+  Copyright (C) Python Software Foundation.
+
+websocket-client
+  License: Apache License 2.0, see licenses\websocket-client-Apache-2.0.txt.
+
+Not bundled, used if present on your PC:
+  - NVIDIA's NVAPI (nvapi64.dll, part of the NVIDIA graphics driver) for the vibrance setting.
+  - The Epic Games Launcher and Rocket League themselves.

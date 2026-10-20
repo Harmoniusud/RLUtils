@@ -1,0 +1,1767 @@
+"""Desktop app: the MMR-over-time chart (fed by Rocket League's own log, plus a one-time import of tracker.gg's
+history), the Games tracker (fed by Rocket League's Stats API), launching Rocket League on a chosen Epic account,
+settings and start with Windows.
+"""
+from __future__ import annotations
+
+import csv
+import getpass
+import json
+import queue
+import sys
+import threading
+import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+from PySide6.QtCore import QEvent, QObject, QTimer, QUrl, Qt, Signal, Slot
+from PySide6.QtGui import QAction, QColor, QDesktopServices
+from PySide6.QtNetwork import QLocalServer, QLocalSocket
+from PySide6.QtWebChannel import QWebChannel
+from PySide6.QtWebEngineCore import QWebEnginePage
+from PySide6.QtWebEngineWidgets import QWebEngineView
+from PySide6.QtWidgets import QApplication, QFileDialog, QMainWindow, QMenu, QSystemTrayIcon
+
+from . import data, game, importer, rllog, stats, ui, vibrance, viewmodel
+from .data import (
+    APP_NAME, DATA_DIR, DB_PATH, FROZEN, ROOT, SOURCE_RL_LOG, THRESHOLDS_PATH, TRACKED_PLAYLISTS, VERSION,
+    load_config, load_thresholds, playlist_name, rank_label, tier_distance, rl_shortcut_path, save_config,
+    switcher_path, switcher_store,
+)
+from .ui import Background
+
+UI_NAME = APP_NAME  # the name the window shows (it said "RL Tracker", the design's name, in 0.9-0.10)
+
+
+# ====================================================================================================
+# Autostart: Start with Windows: one value under HKCU\Software\Microsoft\Windows\CurrentVersion\Run.
+#
+# Changed only when the user flips the setting in the app; no admin rights needed.
+# ====================================================================================================
+
+
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+VALUE = "RLUtils"
+OLD_VALUE = "RLTracker"  # the name before 0.8; removed when the setting changes
+
+
+def command() -> str:
+    if FROZEN:
+        return f'"{sys.executable}" --tray'
+    exe = Path(sys.executable)
+    windowless = exe.with_name("pythonw.exe")
+    return f'"{windowless if windowless.exists() else exe}" "{ROOT / "rlutils.py"}" --tray'
+
+
+def is_enabled() -> bool:
+    if sys.platform != "win32":
+        return False
+    import winreg
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as k:
+            winreg.QueryValueEx(k, VALUE)
+            return True
+    except OSError:
+        return False
+
+
+def set_enabled(on: bool) -> None:
+    if sys.platform != "win32":
+        return
+    import winreg
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as k:
+        for name in ((OLD_VALUE,) if on else (VALUE, OLD_VALUE)):
+            try:
+                winreg.DeleteValue(k, name)
+            except FileNotFoundError:
+                pass
+        if on:
+            winreg.SetValueEx(k, VALUE, 0, winreg.REG_SZ, command())
+
+
+# ====================================================================================================
+# App: the MMR chart, Games, Play (Rocket League on a chosen Epic account) and Settings.
+# ====================================================================================================
+
+
+
+
+class LogWatcher(QObject):
+    """Every `rl_log.every_s` seconds, on a worker thread: read the new lines of Rocket League's logs and save
+    the ranked MMR in them (rllog). Where each file was read up to is kept in rllog_state.json, so a restart
+    carries on there, and a log the game rotated (Launch.log -> Launch-backup-*.log) is finished, not re-read.
+    Only reads files; never touches the game."""
+
+    saved = Signal(str, int)    # profile key, new readings
+    status = Signal()
+
+    STATE_PATH = DATA_DIR / "rllog_state.json"
+
+    def __init__(self, window: "MainWindow"):
+        super().__init__(window)
+        self.window = window
+        self.bg = Background(self)
+        cfg = window.cfg["rl_log"]
+        self.dir = Path(cfg["dir"]) if str(cfg.get("dir") or "").strip() else rllog.default_log_dir()
+        self.tailer = rllog.LogTailer(self.dir, rllog.load_state(self.STATE_PATH))
+        self.busy = False
+        self.state = ("wait", "Starting")
+        self.last: tuple[str, rllog.Reading] | None = None   # newest reading saved while the app runs
+        self.skipped: dict[str, int] = {}                      # reason -> count, while the app runs
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.tick)
+
+    def start(self) -> None:
+        cfg = self.window.cfg["rl_log"]
+        if not cfg.get("enabled", True):
+            self._status("off", "Turned off (rl_log.enabled in config.json)")
+            return
+        self.timer.start(max(1, int(cfg.get("every_s", 5))) * 1000)
+        QTimer.singleShot(1000, self.tick)
+
+    def _status(self, state: str, text: str) -> None:
+        if (state, text) != self.state:
+            self.state = (state, text)
+            self.status.emit()
+
+    def tick(self) -> None:
+        if self.busy:
+            return
+        self.busy = True
+        self.bg.run(self._work, self._done)
+
+    def _work(self):
+        """(readings found, save result), or None when the log folder doesn't exist. Runs on the worker thread;
+        the tailer is only ever used here, one call at a time."""
+        if not self.dir.is_dir():
+            return None
+        readings = self.tailer.poll()
+        result = rllog.save(readings)
+        self.tailer.commit()  # only after saving: if that failed, the same lines are read again next time
+        rllog.save_state(self.STATE_PATH, self.tailer.state())
+        return readings, result
+
+    def _done(self, res, err) -> None:
+        self.busy = False
+        if err:
+            self._status("error", f"Couldn't read the game's log: {err}")
+            return
+        if res is None:
+            self._status("off", f"Rocket League's log folder not found: {self.dir}")
+            return
+        _readings, result = res
+        for why, n in result.skipped.items():
+            self.skipped[why] = self.skipped.get(why, 0) + n
+        if result.last:
+            self.last = result.last
+        self._status("ok", "Watching Rocket League's log")
+        if result.saved:
+            self.saved.emit(result.last[0], result.saved)
+
+
+class VibranceWatcher(QObject):
+    """Every second: while Rocket League is the foreground window, set NVIDIA Digital Vibrance on its monitor
+    to vibrance.pct, and put back the level it had otherwise. Keeps the OBS Color Correction filter on the
+    Rocket League capture in step (retried every 15 s while OBS isn't reachable), so recordings show it too."""
+
+    status = Signal(str)
+
+    def __init__(self, window: "MainWindow"):
+        super().__init__(window)
+        self.window = window
+        self.bg = Background(self)
+        try:
+            self.nv, self.nv_error = vibrance.Nvapi(), ""
+        except vibrance.VibranceError as exc:
+            self.nv, self.nv_error = None, str(exc)
+        self.applied: dict[int, int] = {}  # display handle -> level to put back
+        self.screen_state = ""
+        self.obs_state = ""
+        self.obs_synced: float | None = None
+        self.obs_busy = False
+        self.obs_retry_at = 0.0
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.tick)
+
+    def start(self) -> None:
+        self.timer.start(1000)
+        self.tick()
+
+    def _emit(self) -> None:
+        self.status.emit(self.screen_state + ("<br>" + self.obs_state if self.obs_state else ""))
+
+    def tick(self) -> None:
+        cfg = self.window.cfg["vibrance"]
+        pct = int(cfg["pct"])
+        screen = self.nv_error and f"Screen: {self.nv_error}"
+        if self.nv:
+            try:
+                hwnd = vibrance.foreground_window()
+                in_rl = bool(hwnd) and game._process_name(vibrance.window_pid(hwnd)) == "rocketleague.exe"
+                if in_rl and pct > 50:
+                    disp = self.nv.display_for(vibrance.monitor_device(hwnd)) or next(iter(self.nv.displays()), None)
+                    if disp:
+                        cur, lo, hi = self.nv.info(disp)
+                        want = vibrance.pct_to_level(pct, lo, hi)
+                        self.applied.setdefault(disp, cur)
+                        if cur != want:
+                            self.nv.set_level(disp, want)
+                    screen = f"Screen: {pct}% while Rocket League is in front (now)"
+                else:
+                    self.restore()
+                    screen = ("Screen: driver default (slider at 50%)" if pct <= 50
+                              else f"Screen: {pct}% once Rocket League is in front")
+            except vibrance.VibranceError as exc:
+                screen = f"Screen: {exc}"
+        if screen != self.screen_state:
+            self.screen_state = screen
+            self._emit()
+        self._sync_obs(cfg, pct)
+
+    def restore(self) -> None:
+        for disp, level in list(self.applied.items()):
+            try:
+                self.nv.set_level(disp, level)
+            except vibrance.VibranceError:
+                pass
+        self.applied.clear()
+
+    def _sync_obs(self, cfg: dict, pct: int) -> None:
+        want = vibrance.pct_to_obs_saturation(pct, float(cfg["obs_strength"])) if cfg["obs"] else 0.0
+        if self.obs_busy or want == self.obs_synced or time.monotonic() < self.obs_retry_at:
+            return
+        self.obs_busy = True
+        url, password = cfg["obs_url"], cfg["obs_password"]
+
+        def work():
+            obs = vibrance.Obs(url, password)
+            try:
+                sources = obs.rl_sources()
+                for name in sources:
+                    obs.set_saturation(name, want)
+                return sources
+            finally:
+                obs.close()
+
+        def done(sources, err):
+            self.obs_busy = False
+            if err:
+                self.obs_retry_at = time.monotonic() + 15
+                reason = "not running" if isinstance(err, OSError) else str(err)
+                self.obs_state = f"Recordings: OBS {reason}; retrying"
+            elif not sources:
+                self.obs_retry_at = time.monotonic() + 15
+                self.obs_state = "Recordings: OBS has no Game/Window Capture of RocketLeague.exe"
+            else:
+                self.obs_synced = want
+                names = ", ".join(sources)
+                self.obs_state = (f"Recordings: OBS filter '{vibrance.OBS_FILTER}' on {names}, saturation {want:+.2f}"
+                                  if want > 0 else f"Recordings: OBS filter off on {names}")
+            self._emit()
+
+        self.bg.run(work, done)
+
+
+class GamesWatcher(QObject):
+    """Follows Rocket League's Stats API on a background thread (stats.run_reader) and saves every finished
+    match: to the profile of your account in it (added the first time). Only listens; never sends to the game."""
+
+    saved = Signal(str, str)   # profile key, one-line summary
+    status = Signal(str, str)  # state ("ok", "live", "wait", "error", "off"), text
+
+    def __init__(self, window: "MainWindow"):
+        super().__init__(window)
+        self.window = window
+        self.events: queue.Queue = queue.Queue()
+        self.stop_event = threading.Event()
+        self.thread: threading.Thread | None = None
+        self.feed = stats.GameFeed(lambda rec: self.events.put(("game", rec)),
+                                   log=lambda line: self.events.put(("log", line)),
+                                   on_rate=lambda line: self.events.put(("rate", line)))
+        self.link = "waiting"
+        self.last = ""  # last saved / skipped line
+        self.state = ("off", "Game stats off")
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self._drain)
+
+    def known_ids(self) -> frozenset:
+        ids = {stats.strip_split(p["player_id"]) for p in data.list_profiles() if p["player_id"]}
+        account = self.window.cfg["launch"].get("account")
+        if account:
+            ids.add(stats.strip_split(data.epic_player_id(account)))
+        return frozenset(i for i in ids if i)
+
+    def start(self) -> None:
+        cfg = self.window.cfg["games"]
+        if not cfg.get("enabled", True):
+            self._status("off", "Game stats are off (games.enabled in config.json)")
+            return
+        self.feed.known_ids = self.known_ids()
+        self.feed.save_offline = bool(cfg.get("save_offline"))
+        self.thread = threading.Thread(
+            target=stats.run_reader, name="statsapi", daemon=True,
+            args=(self.feed, cfg["host"], int(cfg["web_port"]), int(cfg["port"]), self.stop_event, self.events),
+            kwargs={"is_game_running": lambda: game.process_running("RocketLeague.exe")})
+        self.thread.start()
+        self.timer.start(500)
+        self._status("wait", "Waiting for Rocket League's Stats API")
+
+    def stop(self) -> None:
+        self.stop_event.set()
+
+    def _status(self, state: str, text: str) -> None:
+        if (state, text) != self.state:
+            self.state = (state, text)
+            self.status.emit(state, text)
+
+    def _drain(self) -> None:
+        while True:
+            try:
+                kind, value = self.events.get_nowait()
+            except queue.Empty:
+                break
+            if kind == "status":
+                self.link = value
+                if value != "waiting":
+                    self.feed.known_ids = self.known_ids()  # accounts may have been added since
+            elif kind == "off":
+                self.link = "off"
+                self.last = value + ". Set PacketSendRate (e.g. 10) in TAStatsAPI.ini and restart the game."
+            elif kind == "log":
+                self.last = f"{datetime.now():%H:%M} {value}"
+                self._file_log(value)
+            elif kind in ("rate", "error"):  # evidence for odd game modes (statsapi.log in the data folder)
+                self._file_log(f"{kind}: {value}")
+            elif kind == "game":
+                self._save(value)
+        live = self.feed.live
+        if self.link == "off":
+            self._status("error", self.last)
+        elif self.link == "waiting":
+            self._status("wait", "Waiting for Rocket League's Stats API" + (f". Last: {self.last}" if self.last else ""))
+        elif live and live.get("playlist") is not None and not live.get("online") and not self.feed.save_offline:
+            self._status("ok", f"Offline game ({playlist_name(live['playlist'])}: freeplay, training or bots), "
+                               "not saved")
+        elif live and live.get("playlist") is not None:
+            sc = live.get("scores") or {}
+            mine = live.get("my_team")
+            score = (f"{sc.get(0, 0)}-{sc.get(1, 0)} (blue-orange)" if mine is None
+                     else f"you {sc.get(mine, 0)}-{sc.get(1 - mine, 0)}")
+            clock = "" if live.get("time_left") is None else f", {live['time_left'] // 60}:{live['time_left'] % 60:02d}"
+            self._status("live", f"In a match: {playlist_name(live['playlist'])}, {score}"
+                                 f"{' OT' if live.get('overtime') else clock}")
+        else:
+            self._status("ok", f"Connected to the Stats API ({self.link.split('(')[-1].rstrip(')')})"
+                               + (f". Last: {self.last}" if self.last else ""))
+
+    @staticmethod
+    def _file_log(line: str) -> None:
+        try:
+            path = DATA_DIR / "statsapi.log"
+            if path.exists() and path.stat().st_size > 1_000_000:
+                path.replace(path.with_suffix(".log.old"))
+            with path.open("a", encoding="utf-8") as f:
+                f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} {line}\n")
+        except OSError:
+            pass
+
+    def _save(self, rec: stats.GameRecord) -> None:
+        try:
+            key = data.profile_for_player(rec.self_id, rec.self_name)
+            gid = data.save_game(key, rec)
+        except Exception as exc:  # a locked or broken database must not stop the reader
+            self.last = f"{datetime.now():%H:%M} couldn't save a game: {exc}"
+            return
+        line = (f"{'Win' if rec.won else 'Loss'} {rec.team_goals}-{rec.opp_goals}"
+                f"{' OT' if rec.overtime else ''} in {playlist_name(rec.playlist_id)}")
+        self.last = f"{datetime.now():%H:%M} saved {line}" if gid else f"{datetime.now():%H:%M} already saved"
+        if gid:
+            self.saved.emit(key, line)
+
+
+class Bridge(QObject):
+    """The page's link to Python (QWebChannel object "bridge"): state and events out, clicks in."""
+
+    state = Signal(str)   # the whole view state, JSON
+    event = Signal(str)   # one-off commands for the page: {"go": page} or {"modal": {...}}
+
+    def __init__(self, window: "MainWindow"):
+        super().__init__(window)
+        self.window = window
+
+    @Slot(str, str)
+    def call(self, action: str, payload: str) -> None:
+        try:
+            value = json.loads(payload) if payload else None
+        except ValueError:
+            value = None
+        self.window.on_call(action, value)
+
+
+class WebPage(QWebEnginePage):
+    """Opens links in the browser instead of inside the app; page errors go to the log."""
+
+    def acceptNavigationRequest(self, url, nav_type, is_main_frame) -> bool:
+        if url.scheme() in ("http", "https"):
+            QDesktopServices.openUrl(url)
+            return False
+        return super().acceptNavigationRequest(url, nav_type, is_main_frame)
+
+    def javaScriptConsoleMessage(self, level, message, line, source) -> None:
+        if level != QWebEnginePage.JavaScriptConsoleMessageLevel.InfoMessageLevel:
+            print(f"page: {message} ({Path(source).name}:{line})", file=sys.stderr)
+
+
+RANGES = [("7D", 7), ("30D", 30), ("Season", 90), ("All", None)]  # Season: the last 90 days
+GRANULARITIES = [("Game", "raw"), ("Day", "daily"), ("Week", "weekly")]
+RANK_WINDOW = timedelta(days=120)
+INSTANCE_NAME = f"RLUtils-{getpass.getuser()}"
+WEB_DIR = Path(__file__).resolve().parent / "web"
+EDGES = {"n": Qt.TopEdge, "s": Qt.BottomEdge, "w": Qt.LeftEdge, "e": Qt.RightEdge}
+
+
+def _ago(when: datetime | None) -> str:
+    if when is None:
+        return "never"
+    mins = int((datetime.now(timezone.utc) - when).total_seconds() // 60)
+    return "just now" if mins < 1 else f"{mins} min ago" if mins < 60 else f"{mins // 60} h ago"
+
+
+def _size(n: int) -> str:
+    return f"{n / 1_048_576:.1f} MB" if n >= 1_048_576 else f"{max(1, n // 1024)} KB"
+
+
+class MainWindow(QMainWindow):
+    """A frameless window holding the web UI (rlutils/web): title bar, rail, header, pages and status bar are
+    all drawn by the page. Python keeps the state and does the work; the page shows it and sends clicks."""
+
+    PAGES = ["MMR", "Games", "Play", "Settings"]
+
+    def __init__(self, start_hidden: bool = False):
+        super().__init__()
+        self.setWindowTitle(APP_NAME)
+        self.setWindowIcon(ui.make_icon())
+        self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint)
+        self.resize(1280, 800)
+        self.setMinimumSize(1060, 660)
+        self.cfg = load_config()
+        if data.migrate_config(self.cfg):  # settings older versions left empty, made explicit (once)
+            save_config(self.cfg)
+        self._setup: dict | None = None  # the setup panel, while open
+        self.bg = Background(self)
+        self.thresholds = load_thresholds(THRESHOLDS_PATH)
+        self.playlist = self.cfg["overlay"]["playlist"]
+        self.profile_key: str | None = None
+        self.screen_name = "MMR"
+        self.range_key = "30D"
+        self.gran_key = "Game"
+        self.games_pl: int | None = None
+        self.games_kind = "All"  # All / Ranked / Casual
+        self.selected_game: int | None = None
+        self._db_mtime = None
+        self._quitting = False
+        self._tray_hint_shown = False
+        self._busy = False                      # switching account / adding one
+        self._phase = "idle"                    # Play: idle, switch, launch, running
+        self._launch_until = 0.0
+        self._play_note: tuple[str, str, str] | None = None  # (colour, title, detail) shown under Play
+        self._accounts: list[dict] = []
+        self._accounts_state = ("loading", "")  # loading / ok / error, text
+        self._accounts_at: datetime | None = None
+        self._rl_running = False
+        self._procs_busy = False
+        self._msg = ("", 0.0)
+        self._vm: dict = {}
+        self._last_json = ""
+        self._games_all: list[dict] = []
+        self._log_last: tuple[int, dict] | None = None  # newest rl_log reading of the profile shown
+
+        self.view = QWebEngineView(self)
+        self.view.setPage(WebPage(self.view))
+        self.view.page().setBackgroundColor(QColor("#202020"))
+        self.view.setContextMenuPolicy(Qt.NoContextMenu)
+        self.bridge = Bridge(self)
+        self.channel = QWebChannel(self.view.page())
+        self.channel.registerObject("bridge", self.bridge)
+        self.view.page().setWebChannel(self.channel)
+        self.setCentralWidget(self.view)
+        self.view.load(QUrl.fromLocalFile(str(WEB_DIR / "index.html")))
+        self._build_tray()
+
+        self.reload_profiles(select=self.cfg["overlay"]["profile"] or None, push=False)
+        self._imp: dict | None = None                    # the Import history panel, while open
+        self._imp_preview: importer.HistoryPreview | None = None
+        self._imp_payload = None                         # the pasted history, until it is imported
+        self.mmrlog = LogWatcher(self)
+        self.mmrlog.status.connect(self.push)
+        self.mmrlog.saved.connect(self._on_log_saved)
+        self.vibrance = VibranceWatcher(self)
+        self.vibrance.status.connect(lambda _text: self.push())
+        self.games = GamesWatcher(self)
+        self.games.status.connect(lambda _s, _t: self.push())
+        self.games.saved.connect(self._on_game_saved)
+        self.mmrlog.start()
+        self.vibrance.start()
+        self.games.start()
+        self.reload_accounts()
+        if not self.cfg["app"].get("setup_done"):
+            self.open_setup()  # first start: Epic name, the game, the Stats API
+
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self._poll)
+        self.timer.start(2000)
+        self.clock = QTimer(self)  # "2 min ago" texts
+        self.clock.timeout.connect(self.push)
+        self.clock.start(20_000)
+        self._poll()
+        for i in range(len(self.PAGES)):  # Ctrl+1..4 also when the page doesn't have focus
+            act = QAction(self)
+            act.setShortcut(f"Ctrl+{i + 1}")
+            act.triggered.connect(lambda _checked=False, n=i: self.go(self.PAGES[n]))
+            self.addAction(act)
+        self.start_hidden = start_hidden and QSystemTrayIcon.isSystemTrayAvailable()
+
+    # --- the page --------------------------------------------------------------
+
+    def on_call(self, action: str, v) -> None:
+        handler = {
+            "ready": self._ready, "screen": self._set_screen,
+            "move": lambda _v: self.windowHandle().startSystemMove(),
+            "resize": self._start_resize, "minimize": lambda _v: self.showMinimized(),
+            "maximize": lambda _v: self.showNormal() if self.isMaximized() else self.showMaximized(),
+            "close": lambda _v: self.close(), "toTray": lambda _v: self.to_tray(),
+            "pickProfile": self._pick_profile, "newProfile": lambda _v: self._new_profile(),
+            "trackPlayer": self._track_player, "removeProfile": self._remove_profile,
+            "removeProfileConfirmed": self._remove_profile_confirmed,
+            "setPlaylist": self._set_playlist, "setRange": self._set_range, "setGran": self._set_gran,
+            "setGamesPlaylist": self._set_games_playlist, "setGamesKind": self._set_games_kind, "selectGame": self._select_game,
+            "deleteGame": self._delete_game,
+            "play": lambda _v: self.play(), "pickAccount": self._pick_account,
+            "refreshAccounts": lambda _v: self.reload_accounts(),
+            "addAccount": lambda _v: self.add_account(), "addAccountConfirmed": lambda _v: self._add_account(),
+            "addCurrent": lambda _v: self.save_current_account(),
+            "importOpen": lambda _v: self.open_import(), "importCheck": self._import_check,
+            "importConfirm": lambda _v: self._import_confirm(), "importBack": lambda _v: self._import_back(),
+            "importCancel": lambda _v: self._import_close(),
+            "setupOpen": lambda v: self.open_setup(v if v in self.SETUP_STEPS else "profile"),
+            "setupProfile": self._setup_profile, "setupGo": self._setup_go, "setupFinish": self._setup_finish,
+            "findGame": self._find_game, "chooseGame": self._choose_game, "setLaunch": self._set_launch,
+            "enableStats": self._enable_stats,
+            "setVibrance": self._set_vibrance, "toggleObs": self._toggle_obs,
+            "toggle": self._toggle_setting, "setPath": self._set_path, "browse": self._browse,
+            "import": lambda _v: self.open_import(),
+            "export": lambda _v: self.export_history(),
+            "openFolder": lambda _v: QDesktopServices.openUrl(QUrl.fromLocalFile(str(DATA_DIR))),
+            "tray": self._tray_action,
+        }.get(action)
+        if handler is None:
+            print(f"page: unknown action {action!r}", file=sys.stderr)
+            return
+        handler(v)
+        self.push()
+
+    def _ready(self, _screen) -> None:
+        self._last_json = ""  # the page was (re)loaded: send everything, on the page asked for before it loaded
+        self.bridge.event.emit(json.dumps({"go": self.screen_name}))
+
+    def _set_screen(self, name) -> None:
+        if name in self.PAGES and name != self.screen_name:
+            self.screen_name = name
+            if name == "Play":
+                self._update_processes()
+
+    def go(self, page: str) -> None:
+        self.screen_name = page
+        self.bridge.event.emit(json.dumps({"go": page}))
+
+    def modal(self, title: str, text: str, buttons: list[dict] | None = None, field: dict | None = None) -> None:
+        """A dialog drawn by the page. buttons: [{label, a (action to call), v, primary, danger}]. field: a text
+        box ({placeholder}); its text goes to the button's action as {"value": ...}."""
+        self.bridge.event.emit(json.dumps({"modal": {"title": title, "text": text, "field": field,
+                                                     "buttons": buttons or [{"label": "OK", "primary": True}]}}))
+
+    def message(self, text: str, seconds: float = 15) -> None:
+        self._msg = (text, time.monotonic() + seconds)
+        QTimer.singleShot(int(seconds * 1000) + 50, self.push)
+        self.push()
+
+    def _start_resize(self, edge) -> None:
+        edges = Qt.Edges()
+        for ch in str(edge):
+            edges |= EDGES.get(ch, Qt.Edges())
+        if edges:
+            self.windowHandle().startSystemResize(edges)
+
+    def push(self) -> None:
+        """Send the view state to the page if anything changed."""
+        if not hasattr(self, "games") or "mmr" not in self._vm:
+            return  # still starting
+        try:
+            state = self._state()
+        except Exception:  # a bug in one view must not stop the others updating later
+            import traceback
+            traceback.print_exc()
+            return
+        text = json.dumps(state, separators=(",", ":"), default=str)
+        if text != self._last_json:
+            self._last_json = text
+            self.bridge.state.emit(text)
+
+    # --- window and tray -------------------------------------------------------
+
+    def _build_tray(self) -> None:
+        self.tray = None
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+        self.tray = QSystemTrayIcon(ui.make_icon(), self)
+        self.tray.setToolTip(APP_NAME)
+        self.tray_menu = QMenu()
+        self.tray_menu.aboutToShow.connect(self._fill_tray_menu)
+        self.tray.setContextMenu(self.tray_menu)
+        self.tray.activated.connect(
+            lambda reason: self.show_from_tray() if reason in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick)
+            else None)
+        self.tray.show()
+
+    def _tray_items(self) -> list[dict]:
+        account = self._current_account()
+        return [
+            {"label": f"Open {UI_NAME}", "a": "open", "bold": True},
+            {"label": "Play", "a": "play", "right": account["name"] if account else ""},
+            {"label": "Import MMR history…", "a": "import"},
+            {"label": "Vibrance", "a": "vibrance", "right": f"{int(self.cfg['vibrance']['pct'])}%"},
+            {"sep": True},
+            {"label": "Start with Windows", "a": "autostart", "check": is_enabled()},
+            {"label": "Quit", "a": "quit"},
+        ]
+
+    def _fill_tray_menu(self) -> None:
+        self.tray_menu.clear()
+        for item in self._tray_items():
+            if item.get("sep"):
+                self.tray_menu.addSeparator()
+                continue
+            label = item["label"] + (f"\t{item['right']}" if item.get("right") else "")
+            act = self.tray_menu.addAction(label)
+            if "check" in item:
+                act.setCheckable(True)
+                act.setChecked(item["check"])
+            if item.get("bold"):
+                f = act.font()
+                f.setBold(True)
+                act.setFont(f)
+            act.triggered.connect(lambda _c=False, a=item["a"]: self._tray_action(a))
+
+    def _tray_action(self, a) -> None:
+        if a == "open":
+            self.show_from_tray()
+        elif a == "play":
+            self.show_from_tray()
+            self.go("Play")
+            self.play()
+        elif a == "import":
+            self.show_from_tray()
+            self.open_import()
+        elif a == "vibrance":
+            self.show_from_tray()
+            self.go("Play")
+        elif a == "autostart":
+            self._set_autostart(not is_enabled())
+        elif a == "quit":
+            self.quit_app()
+        self.push()
+
+    def show_from_tray(self) -> None:
+        self.show()
+        self.setWindowState((self.windowState() & ~Qt.WindowMinimized) | Qt.WindowActive)
+        self.raise_()
+        self.activateWindow()
+
+    def quit_app(self) -> None:
+        self._quitting = True
+        self.mmrlog.timer.stop()
+        self.games.stop()
+        self.vibrance.restore()
+        if self.tray:
+            self.tray.hide()
+        QApplication.quit()
+
+    def closeEvent(self, event) -> None:
+        self._quitting = True
+        super().closeEvent(event)
+        self.quit_app()
+
+    def to_tray(self) -> None:
+        """The footer's Tray button: hide the window; the app keeps running in the tray."""
+        if not self.tray:
+            self.showMinimized()
+            return
+        self.hide()
+        self._tray_hint()
+
+    def _tray_hint(self) -> None:
+        if not self._tray_hint_shown and self.tray:
+            self.tray.showMessage(APP_NAME, "Still running in the tray, reading MMR from the game's log and saving "
+                                            "games. Click the icon to open it again.", QSystemTrayIcon.Information, 4000)
+            self._tray_hint_shown = True
+
+    def changeEvent(self, event) -> None:
+        super().changeEvent(event)
+        if event.type() == QEvent.WindowStateChange:
+            self.push()
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        _allow_taskbar_minimize(self)
+
+    # --- profiles and selections -----------------------------------------------
+
+    def current_profile(self) -> dict | None:
+        return data.get_profile(self.profile_key) if self.profile_key else None
+
+    def reload_profiles(self, select: str | None = None, push: bool = True) -> None:
+        keys = [p["key"] for p in data.list_profiles()]
+        want = select or self.profile_key
+        self.profile_key = want if want in keys else (keys[0] if keys else None)
+        if self.profile_key and self.cfg["overlay"]["profile"] != self.profile_key:
+            self.cfg["overlay"]["profile"] = self.profile_key
+            save_config(self.cfg)
+        self.selected_game = None
+        if self.playlist not in self._playlists():
+            self.playlist = TRACKED_PLAYLISTS[0]
+        self.refresh(push=push)
+
+    def _playlists(self) -> list[int]:
+        ids = list(TRACKED_PLAYLISTS)
+        if self.profile_key:
+            ids += sorted(set(data.playlists_with_snapshots(self.profile_key)) - set(TRACKED_PLAYLISTS))
+        return ids
+
+    def _new_profile(self) -> None:
+        self.modal("Track a player", "Enter someone's Epic name to follow their rank. Their MMR history is "
+                   "imported from tracker.gg next (you paste it in; nothing updates on its own, since the game's "
+                   "log only has your own MMR).\n\n"
+                   "Your own accounts are added by picking them on the Play page.",
+                   [{"label": "Cancel"}, {"label": "Next", "a": "trackPlayer", "primary": True}],
+                   field={"placeholder": "Epic name"})
+
+    def _track_player(self, v) -> None:
+        name = str((v or {}).get("value") or "").strip()
+        if not name:
+            return
+        key = next((p["key"] for p in data.list_profiles() if p["key"].lower() == name.lower()), None)
+        if key is None:
+            key = name
+            data.upsert_profile(key, None)
+            tracked = self.cfg["tracker"].setdefault("tracked", [])
+            if key not in tracked:
+                tracked.append(key)
+            save_config(self.cfg)
+        self.reload_profiles(select=key)
+        self.go("MMR")
+        self.open_import(key)
+
+    def _pick_profile(self, key) -> None:
+        if key and key != self.profile_key:
+            self.reload_profiles(select=key)
+
+    def _remove_profile(self, key) -> None:
+        if key in self.cfg["tracker"].get("tracked", []):
+            self.modal("Stop tracking", f"Stop tracking {key} and delete their saved MMR history?",
+                       [{"label": "Cancel"}, {"label": "Remove", "a": "removeProfileConfirmed", "v": key, "danger": True}])
+
+    def _remove_profile_confirmed(self, key) -> None:
+        tracker = self.cfg["tracker"]
+        if key not in tracker.get("tracked", []):
+            return
+        data.delete_profile(key)
+        tracker["tracked"].remove(key)
+        tracker["ids"].pop(key, None)
+        save_config(self.cfg)
+        self.reload_profiles(select=None if key == self.profile_key else self.profile_key)
+        self.message(f"Stopped tracking {key}.", 6)
+
+    def _set_playlist(self, pid) -> None:
+        if pid is None:
+            return
+        self.playlist = int(pid)
+        if self.cfg["overlay"]["playlist"] != self.playlist:
+            self.cfg["overlay"]["playlist"] = self.playlist
+            save_config(self.cfg)
+        self.refresh(push=False)
+
+    def _set_range(self, key) -> None:
+        if key in dict(RANGES):
+            self.range_key = key
+            self.refresh(push=False)
+
+    def _set_gran(self, key) -> None:
+        if key in dict(GRANULARITIES):
+            self.gran_key = key
+            self.refresh(push=False)
+
+    def _set_games_playlist(self, pid) -> None:
+        self.games_pl = None if pid is None else int(pid)
+        self.selected_game = None
+        self._build_games()
+
+    def _set_games_kind(self, kind) -> None:
+        if kind in viewmodel.KINDS and kind != self.games_kind:
+            self.games_kind = kind
+            self.games_pl = None
+            self.selected_game = None
+            self._build_games()
+
+    def _select_game(self, gid) -> None:
+        if gid is not None and gid != self.selected_game:
+            self.selected_game = int(gid)
+            self._build_games()
+
+    def _delete_game(self, gid) -> None:
+        if gid is None:
+            return
+        data.delete_game(int(gid))
+        if self.selected_game == gid:
+            self.selected_game = None
+        self.refresh(push=False)
+        self.message("Game deleted.", 6)
+
+    def _on_game_saved(self, profile_key: str, line: str) -> None:
+        self.message(f"Game saved for {profile_key}: {line}")
+        if profile_key != self.profile_key:
+            self.reload_profiles(select=profile_key)  # the game was played on another account
+        else:
+            self.refresh()
+
+    def _on_log_saved(self, profile_key: str, added: int) -> None:
+        key, r = self.mmrlog.last
+        self.message(f"MMR from the game's log: {viewmodel.short(r.playlist_id)} {r.mmr} for {key}"
+                     if added == 1 else f"{added} MMR readings from the game's log (newest: "
+                                        f"{viewmodel.short(r.playlist_id)} {r.mmr} for {key})")
+        if self.profile_key is None:
+            self.reload_profiles(select=profile_key)
+        else:
+            self.refresh()
+
+    # --- polling ---------------------------------------------------------------
+
+    def _poll(self) -> None:
+        self._update_processes()
+        try:
+            mtime = DB_PATH.stat().st_mtime
+        except OSError:
+            mtime = None
+        if self._db_mtime is not None and mtime != self._db_mtime:
+            self.refresh(push=False)
+        self._db_mtime = mtime
+        self.push()
+
+    def _update_processes(self) -> None:
+        """Check whether Rocket League runs, on a worker thread (never block the UI thread: the page
+        stops drawing while it waits), then update the Play state."""
+        if self._procs_busy:
+            return
+        self._procs_busy = True
+
+        def work():
+            return "rocketleague.exe" in game.process_names()
+
+        def done(res, err):
+            self._procs_busy = False
+            if not err:
+                self._rl_running = res
+                self._apply_processes()
+                self.push()
+
+        self.bg.run(work, done)
+
+    def _apply_processes(self) -> None:
+        if self._rl_running and self._phase in ("idle", "launch"):
+            self._phase = "running"
+            self._play_note = None
+        elif not self._rl_running and self._phase == "running":
+            self._phase = "idle"
+        elif self._phase == "launch" and time.monotonic() > self._launch_until:
+            self._phase = "idle"
+            self._play_note = (viewmodel.WARN, "Rocket League didn't start",
+                               "Nothing started within 3 minutes. Check Steam and the Rocket League shortcut in Settings.")
+
+    # --- view state ------------------------------------------------------------
+
+    def refresh(self, push: bool = True) -> None:
+        """Reload what comes from the database (readings, games) and rebuild the pages."""
+        profile = self.current_profile()
+        self._games_all = data.list_games(profile["key"]) if profile else []
+        snaps = {}
+        for pid in {self.playlist, *{g["playlist_id"] for g in self._games_all}}:
+            rows = data.list_snapshots(profile["key"], pid) if profile else []
+            snaps[pid] = [(datetime.fromisoformat(r["recorded_at"]), r) for r in rows]
+        self._snaps = snaps
+        self._deltas = viewmodel.game_mmr_deltas(
+            self._games_all, {pid: [(t, r["rating"]) for t, r in rows] for pid, rows in snaps.items()})
+        self._positions = viewmodel.session_positions(self._games_all, self._gap())
+        self._build_mmr()
+        self._build_games()
+        self._build_profiles()
+        self._readings = len(data.all_snapshots(profile["key"])) if profile else 0
+        logged = [(pid, data.latest_snapshot(profile["key"], pid, SOURCE_RL_LOG)) for pid in TRACKED_PLAYLISTS] \
+            if profile else []
+        logged = [(pid, row) for pid, row in logged if row]
+        self._log_last = max(logged, key=lambda p: datetime.fromisoformat(p[1]["recorded_at"]), default=None)
+        if push:
+            self.push()
+
+    def _gap(self) -> timedelta:
+        return timedelta(minutes=int(self.cfg.get("session_gap_min", 30)))
+
+    def _rank_of(self, row: dict, pid: int) -> tuple[int | None, int | None]:
+        return viewmodel.rank_of(row, self.thresholds.get(pid))
+
+    def _distance(self, profile: dict, pid: int):
+        rows = self._snaps.get(pid) or [(datetime.fromisoformat(r["recorded_at"]), r)
+                                        for r in data.list_snapshots(profile["key"], pid)]
+        if not rows:
+            return None, None
+        last = rows[-1][1]
+        tier, div = self._rank_of(last, pid)
+        since = datetime.now(timezone.utc) - RANK_WINDOW
+        recent = [(r["rating"], r["tier_id"], r["division_id"]) for t, r in rows if t >= since]
+        return last, tier_distance(last["rating"], tier, recent, self.thresholds.get(pid))
+
+    def _build_mmr(self) -> None:
+        profile, pid = self.current_profile(), self.playlist
+        table = self.thresholds.get(pid)
+        rows = self._snaps.get(pid, [])
+        days = dict(RANGES)[self.range_key]
+        start = datetime.now(timezone.utc) - timedelta(days=days) if days else None
+        in_range = [(t, r) for t, r in rows if start is None or t >= start]
+        before = next((r["rating"] for t, r in reversed(rows) if start is not None and t < start), None)
+        games = [g for g in self._games_all if g["playlist_id"] == pid
+                 and (start is None or datetime.fromisoformat(g["ended_at"]) >= start)]
+        last, dist = self._distance(profile, pid) if profile else (None, None)
+
+        top = {"rank": "", "mmr": "—", "today": "", "todayColor": viewmodel.MUTED,
+               "gem": "#b78cff", "rankColor": "#b9a2ff"}
+        if not profile:
+            top["rank"] = "Pick an account on the Play page"
+            gauge = viewmodel.gauge(0, None, None, None)
+            gauge["tier"] = "No profile yet"
+        elif not last:
+            top["rank"] = f"{viewmodel.title(pid)}: no readings yet"
+            gauge = viewmodel.gauge(0, None, None, None)
+            gauge["tier"] = "No readings yet"
+        else:
+            tier, div = self._rank_of(last, pid)
+            top["rank"] = viewmodel.rank_text(tier, div) or "Rank unknown"
+            top["mmr"] = str(last["rating"])
+            midnight = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
+            prior = next((r["rating"] for t, r in reversed(rows) if t < midnight), None)
+            change = last["rating"] - prior if prior is not None else 0
+            top["today"] = f"{viewmodel.sign(change)} today"
+            top["todayColor"] = viewmodel.WIN if change > 0 else viewmodel.LOSS if change < 0 else viewmodel.MUTED
+            gauge = viewmodel.gauge(last["rating"], tier, div, dist)
+
+        chart = viewmodel.chart(in_range, table, dict(GRANULARITIES)[self.gran_key])
+        n = len(chart["points"])
+        if not profile:
+            empty = "No profile yet.\nPick an account on the Play page."
+        elif not rows:
+            empty = (f"No {viewmodel.title(pid)} readings yet.\nThey're read from the game's log each time you "
+                     "queue ranked. Past MMR: Play page > Import history.")
+        else:
+            empty = "No readings in this range.\nPick a longer range above."
+        self._vm["mmr"] = {
+            "ranges": [{"id": k, "label": k} for k, _ in RANGES], "range": self.range_key,
+            "grans": [{"id": k, "label": k} for k, _ in GRANULARITIES], "gran": self.gran_key,
+            "gauge": gauge, "cards": viewmodel.mmr_cards(in_range, before, table, games), "chart": chart,
+            "count": f"{n} point{'s' if n != 1 else ''} · {self.gran_key.lower()}", "empty": empty,
+        }
+        self._vm["top"] = top
+        self._vm["pl"] = {"options": [{"id": p, "label": viewmodel.short(p), "more": p not in TRACKED_PLAYLISTS}
+                                      for p in self._playlists()],
+                          "cur": pid, "title": viewmodel.title(pid)}
+
+    def _build_games(self) -> None:
+        vm = viewmodel.games_page(self._games_all, self.games_pl, self.selected_game, self._deltas,
+                                  self._positions, datetime.now().astimezone(), self.games_kind)
+        self.games_pl = vm["pl"]
+        self.selected_game = vm["sel"]
+        self._vm["games"] = vm
+
+    def _build_profiles(self) -> None:
+        rows = []
+        for p in data.list_profiles():
+            n = sum(c for _pid, c in data.game_playlists(p["key"]))
+            readings = len(data.all_snapshots(p["key"]))
+            tracked = p["key"] in self.cfg["tracker"].get("tracked", [])
+            rows.append({"key": p["key"], "initial": (p["key"][:1] or "?").upper(), "on": p["key"] == self.profile_key,
+                         "tracked": tracked,
+                         "sub": f"Tracked · {readings:,} readings" if tracked
+                         else f"{n:,} game{'s' if n != 1 else ''} · {readings:,} readings"})
+        self._vm["profiles"] = rows
+
+    def _state(self) -> dict:
+        profile = self.current_profile()
+        return {
+            "app": {"title": UI_NAME, "version": VERSION, "max": self.isMaximized()},
+            "profile": {"name": profile["key"], "initial": profile["key"][:1].upper()} if profile else None,
+            "profiles": self._vm["profiles"], "top": self._vm["top"], "pl": self._vm["pl"],
+            "mmr": self._vm["mmr"], "games": self._vm["games"],
+            "log": self._log_view(), "imp": self._import_view(), "setup": self._setup_view(),
+            "api": self._api_view(), "play": self._play_view(),
+            "settings": self._settings_view(profile), "status": self._status_view(), "tray": self._tray_items(),
+        }
+
+    def _log_view(self) -> dict:
+        """The MMR source: Rocket League's log. Header pill and the Play page's MMR card."""
+        state, text = self.mmrlog.state
+        last = self._log_last  # newest rl_log reading of the profile shown: (playlist id, row)
+        if last:
+            pid, row = last
+            when = datetime.fromisoformat(row["recorded_at"]).astimezone()
+            day = "" if when.date() == datetime.now().date() else f"{when:%d %b} "
+            last_text = f"Last: {viewmodel.short(pid)} {row['rating']} at {day}{when:%H:%M}"
+        else:
+            last_text = "No readings from the log yet for this profile"
+        skipped = sum(self.mmrlog.skipped.values())
+        skip_text = (f" · {skipped} not saved ({', '.join(sorted(self.mmrlog.skipped))})" if skipped else "")
+        if state == "ok":
+            v = {"color": viewmodel.WIN, "short": "watching", "title": "Reading the game's log",
+                 "detail": last_text + skip_text}
+        elif state == "error":
+            v = {"color": viewmodel.LOSS, "short": "error", "title": "Couldn't read the log", "detail": text}
+        elif state == "off":
+            v = {"color": viewmodel.FAINT, "short": "off", "title": "Not reading the log", "detail": text}
+        else:
+            v = {"color": viewmodel.FAINT, "short": "starting", "title": "Starting", "detail": text}
+        v["full"] = f"{text}. {v['detail']}" if v["detail"] != text else text
+        v["note"] = ("Your MMR is read from Rocket League's log each time you queue ranked, so a match's change "
+                     "shows when you queue the next one. Readings from a party someone else leads aren't saved.")
+        return v
+
+    def _import_view(self) -> dict | None:
+        imp = self._imp
+        if not imp:
+            return None
+        key = imp["profile"]
+        tid = self._tracker_id(key)
+        name = self._tracker_name(key)
+        v = {"profile": key, "step": imp["step"], "error": imp.get("error") or "", "info": imp.get("info") or "",
+             "clear": imp["clear"], "profileUrl": importer.profile_url(name), "profileName": name,
+             "historyUrl": importer.history_url(tid) if tid else "", "trackerId": tid}
+        p = self._imp_preview
+        if imp["step"] == "preview" and p:
+            v["preview"] = {
+                "identity": p.identity,
+                # tracker.gg's readings are days (00:00 UTC): shown as those days, not moved to local time
+                "range": f"{p.first:%d %b %Y} – {p.last:%d %b %Y}",
+                "total": p.total, "new": len(p.new), "stored": p.stored, "conflicts": p.conflicts,
+                "malformed": p.malformed, "examples": p.examples,
+                "playlists": [{"name": r.name, "n": r.readings, "new": r.new, "ranked": r.ranked} for r in p.playlists],
+            }
+        if imp["step"] == "done":
+            v["result"] = imp.get("result", "")
+        return v
+
+    def _api_view(self) -> dict:
+        state, text = self.games.state
+        w = self.games
+        green = {"color": viewmodel.WIN, "bg": "rgba(108,203,95,.08)", "border": "rgba(108,203,95,.25)"}
+        yellow = {"color": viewmodel.WARN, "bg": "rgba(252,225,0,.08)", "border": "rgba(252,225,0,.25)"}
+        red = {"color": viewmodel.LOSS, "bg": "rgba(255,153,164,.08)", "border": "rgba(255,153,164,.25)"}
+        if state == "live":
+            live = w.feed.live or {}
+            sc, mine = live.get("scores") or {}, live.get("my_team")
+            score = "" if mine is None else f" · {sc.get(mine, 0)}–{sc.get(1 - mine, 0)}"
+            pl = live.get("playlist")  # the feed moves on in its own thread; the state can be a step behind
+            v = {"label": "live", "detail": ("In match" + (f" · {viewmodel.title(pl)}" if pl is not None else "")
+                                             + score + (" OT" if live.get("overtime") else "")), **green}
+        elif state == "ok":
+            v = {"label": "connected", "detail": "Offline game, not saved" if text.startswith("Offline")
+                 else (w.last.split(" ", 1)[-1] if w.last else "Rocket League running"), **green}
+        elif state == "wait":
+            v = {"label": "waiting", "detail": "Waiting for the Stats API" if self._rl_running
+                 else "Rocket League not running", **yellow}
+        elif state == "error":
+            v = {"label": "off", "detail": "Enable it in TAStatsAPI.ini", **red}
+        else:
+            v = {"label": "off", "detail": "Turned off in config.json", **red}
+        v["full"] = text
+        return v
+
+    def _current_account(self) -> dict | None:
+        want = self.cfg["launch"]["account"]
+        return next((a for a in self._accounts if a["id"] == want), None)
+
+    def _play_view(self) -> dict:
+        account = self._current_account()
+        name = account["name"] if account else "the account you pick"
+        ph = self._phase
+        if ph == "switch":
+            status = (viewmodel.WARN, "Switching account…", f"Signing the Epic launcher in as {name}")
+        elif ph == "launch":
+            status = (viewmodel.WARN, "Launching Rocket League…", f"Starting it through {self._launch_text()}")
+        elif ph == "running":
+            api = "Stats API connected" if self.games.state[0] in ("ok", "live") else "waiting for the Stats API"
+            status = (viewmodel.WIN, "Running", f"Rocket League is running · {api}")
+        elif self._play_note:
+            status = self._play_note
+        elif self._switches(account):
+            status = (viewmodel.MUTED, "Ready", f"Switches to {name} (Epic), then starts Rocket League through "
+                                                f"{self._launch_text()}")
+        else:
+            status = (viewmodel.MUTED, "Ready", f"Starts Rocket League through {self._launch_text()}"
+                                                + ("" if self._accounts else ", on the account the Epic launcher has"))
+        busy = ph in ("switch", "launch")
+        btn = {"label": "Running" if ph == "running" else "Starting" if busy else "Play",
+               "bg": "#263a24" if ph == "running" else "#4a3560" if busy else viewmodel.ACCENT,
+               "color": viewmodel.WIN if ph == "running" else "#e6ccff" if busy else "#1a0b24"}
+        a_state, a_text = self._accounts_state
+        note = ("Refreshing…" if a_state == "loading" else "Couldn't read accounts" if a_state == "error"
+                else f"Refreshed {_ago(self._accounts_at)}")
+        accounts = [{"id": a["id"], "name": a["name"], "platform": "EPIC", "on": account is not None and a["id"] == account["id"],
+                     "note": "Signed in to the Epic launcher" if a["active"] else "Saved in the account switcher"}
+                    for a in self._accounts]
+        v = self.cfg["vibrance"]
+        vib_state = [s for s in (self.vibrance.screen_state, self.vibrance.obs_state) if s]
+        return {"phase": ph, "btn": btn, "status": dict(zip(("color", "title", "detail"), status)),
+                "accounts": accounts, "refreshNote": note, "busy": self._busy or busy,
+                "noAccounts": a_text if a_state == "error" else ("Reading saved accounts…" if a_state == "loading"
+                                                                 else "No accounts saved. Play starts the game on the "
+                                                                      "account the Epic launcher is signed into. To "
+                                                                      "switch between several, add them here."),
+                "vib": int(v["pct"]), "obs": bool(v["obs"]), "vibState": vib_state}
+
+    def _settings_view(self, profile: dict | None) -> dict:
+        if profile:
+            tid = self._tracker_id(profile["key"])
+            first = min((g["ended_at"] for g in self._games_all), default=None)
+            n = len(self._games_all)
+            rows = [("Display name", profile["key"]),
+                    ("tracker.gg ID", tid or "not confirmed yet (Import history)"),
+                    ("Epic account", (profile["player_id"] or "none (imported history only)").split("|")[1]
+                     if "|" in (profile["player_id"] or "") else (profile["player_id"] or "none (imported history only)")),
+                    ("Games tracked", f"{n:,} · since {datetime.fromisoformat(first).astimezone():%b %Y}" if first
+                     else "None yet")]
+        else:
+            rows = [("Display name", "No profile yet")]
+        try:
+            size = _size(DB_PATH.stat().st_size)
+        except OSError:
+            size = "not created yet"
+        readings = self._readings
+        launch = self.cfg["launch"]
+        return {
+            "profile": rows,
+            "profileNote": "The profile follows the account picked on the Play page; a profile is added the first "
+                           "time an account is picked or plays. MMR from the game's log, imported history and "
+                           "saved games go to it.",
+            "toggles": [
+                {"key": "start_with_windows", "label": "Start with Windows", "on": is_enabled(),
+                 "sub": "Launch minimized when you sign in"},
+            ],
+            "paths": [
+                {"key": "switcher", "label": "Account switcher", "value": launch["switcher"],
+                 "placeholder": "Built in (accounts saved in the data folder). Or pick your own EpicSwitcher.ps1"},
+            ],
+            "rl": self._rl_view(),
+            "data": f"{DB_PATH.name} · {size} · {readings:,} readings · {len(self._games_all):,} games",
+            "dataDir": str(DATA_DIR),
+        }
+
+    def _installs(self) -> list[dict]:
+        """Rocket League installs (game.find_installs), looked up once and again on Find automatically."""
+        if getattr(self, "_installs_cache", None) is None:
+            try:
+                self._installs_cache = game.find_installs()
+            except OSError:
+                self._installs_cache = []
+        return self._installs_cache
+
+    def _stats_files(self) -> tuple[Path, Path | None]:
+        """(the Documents copy, the install folder's file) of the Stats API setting. The install is the one Play
+        uses when it's known, else the first found."""
+        installs = self._installs()
+        method = self.cfg["launch"].get("method")
+        install = next((i for i in installs if i["method"] == method), installs[0] if installs else None)
+        return stats.stats_ini_path(), (stats.install_ini_path(Path(install["dir"])) if install else None)
+
+    def _stats_api_state(self) -> dict:
+        return stats.stats_api_state(*self._stats_files())
+
+    def _rl_view(self) -> dict:
+        """Settings > Rocket League: how Play starts the game, and whether the Stats API is on."""
+        api = self._stats_api_state()
+        if api["enabled"]:
+            api_text, api_color = f"On ({api['rate']} updates a second, port {api['port']})", viewmodel.WIN
+        elif api["exists"]:
+            api_text, api_color = "Off: the Games page, playstyle, teammates and per-game MMR changes need it", viewmodel.WARN
+        else:
+            api_text, api_color = ("Its settings file doesn't exist yet (start Rocket League once), or enable it "
+                                   "here to create it"), viewmodel.WARN
+        return {"launch": f"Play starts it through {self._launch_text()}", "method": self.cfg["launch"].get("method"),
+                "api": api_text, "apiColor": api_color, "apiOn": api["enabled"], "apiPath": api["path"],
+                "gameRunning": self._rl_running}
+
+    def _status_view(self) -> dict:
+        n, length = viewmodel.current_session(self._games_all, self._gap(), datetime.now(timezone.utc))
+        mins = int(length.total_seconds() // 60)
+        session = (f"Session · {n} game{'s' if n != 1 else ''} · "
+                   + (f"{mins // 60}h {mins % 60:02d}m" if mins >= 60 else f"{mins}m")) if n else "No session going"
+        msg, until = self._msg
+        return {"session": session,
+                "msg": msg if time.monotonic() < until else ""}
+
+    # --- play ------------------------------------------------------------------
+
+    def reload_accounts(self, keep_status: bool = False) -> None:
+        self._accounts_state = ("loading", "")
+        if not keep_status:
+            self._play_note = None
+
+        def done(rows, err):
+            if err:
+                self._accounts_state = ("error", str(err))
+                self.push()
+                return
+            self._accounts = rows
+            self._accounts_state = ("ok", "")
+            self._accounts_at = datetime.now(timezone.utc)
+            if not self._current_account():
+                active = next((r["id"] for r in rows if r["active"]), "")
+                if active:
+                    self._pick_account(active)
+            else:
+                self._follow_account(self._current_account())
+            self.push()
+
+        script, store = switcher_path(self.cfg), switcher_store(self.cfg)
+        self.bg.run(lambda: game.switcher_accounts(script, store), done)
+
+    def _pick_account(self, account_id) -> None:
+        row = next((a for a in self._accounts if a["id"] == account_id), None)
+        if not row or self._busy:
+            return
+        if self.cfg["launch"]["account"] != row["id"]:
+            self.cfg["launch"]["account"] = row["id"]
+            save_config(self.cfg)
+        self._play_note = None
+        self._follow_account(row)
+
+    def _follow_account(self, row: dict | None) -> None:
+        """Show the profile of the account picked on the Play page (added the first time)."""
+        if not row or not row.get("id"):
+            return
+        key = data.profile_for_epic_account(row["id"], row.get("name") or "")
+        if key != self.profile_key:
+            self.reload_profiles(select=key)
+
+    def add_account(self) -> None:
+        if self._busy:
+            return
+        if game.process_running("RocketLeague.exe"):
+            self.modal("Add account", "Close Rocket League first: adding an account restarts the Epic launcher.")
+            return
+        self.modal("Add account",
+                   "The Epic launcher will restart on its sign-in screen.\n\n"
+                   "1. Sign in with the account to add (password and 2FA, with \"Remember me\" ticked).\n"
+                   "2. Come back here and click \"Add current account\".\n\n"
+                   "Your other saved accounts stay saved.\n\n"
+                   "How it works: RLUtils saves the launcher's \"Remember me\" sign-in for each account, encrypted "
+                   "with Windows so only your Windows user on this PC can read it, and swaps it in when you switch. "
+                   "It never sees your password. Don't click \"Sign out\" in the launcher: that ends the saved "
+                   "sign-in and you'd have to add the account again.",
+                   [{"label": "Cancel"}, {"label": "Restart launcher", "a": "addAccountConfirmed", "primary": True}])
+
+    def _add_account(self) -> None:
+        script = switcher_path(self.cfg)
+        self._busy = True
+        self._play_note = (viewmodel.WARN, "Adding an account…", "Restarting the Epic launcher on its sign-in screen")
+
+        def done(message, err):
+            self._busy = False
+            self._play_note = ((viewmodel.LOSS, "Couldn't restart the launcher", str(err)) if err else
+                               (viewmodel.MUTED, "Sign in, then click Add current account", message))
+            self.push()
+
+        store = switcher_store(self.cfg)
+        self.bg.run(lambda: game.add_new_account(script, store), done)
+
+    def save_current_account(self) -> None:
+        if self._busy:
+            return
+        script = switcher_path(self.cfg)
+        self._busy = True
+        self._play_note = (viewmodel.WARN, "Saving the account…", "Saving the account the Epic launcher is signed into")
+
+        def done(message, err):
+            self._busy = False
+            if err:
+                self._play_note = (viewmodel.LOSS, "Couldn't save the account", str(err))
+                self.push()
+                return
+            self._play_note = (viewmodel.WIN, "Account saved", message)
+            self.cfg["launch"]["account"] = ""  # select the account just saved (it's now the active one)
+            self.reload_accounts(keep_status=True)
+            self.push()
+
+        store = switcher_store(self.cfg)
+        self.bg.run(lambda: game.save_current_account(script, store), done)
+
+    def _launch_text(self) -> str:
+        """How Play starts the game, in words."""
+        launch = self.cfg["launch"]
+        method, shortcut = launch.get("method", "auto"), rl_shortcut_path(self.cfg)
+        if method == "path":
+            return f"your {'shortcut' if shortcut and shortcut.suffix.lower() != '.exe' else 'program'} " \
+                   f"{shortcut.name if shortcut else '(none chosen)'}"
+        return {"epic": "the Epic Games launcher", "steam": "Steam"}.get(method, "Epic or Steam, whichever has it")
+
+    def _switches(self, row: dict | None) -> bool:
+        """Whether Play switches the Epic launcher's account first: an account is picked, and the game doesn't
+        start through Steam (which doesn't use the Epic launcher's sign-in)."""
+        return row is not None and self.cfg["launch"].get("method") != "steam"
+
+    def play(self) -> None:
+        """Switch the Epic launcher to the picked account (when accounts are saved), then start the game. With no
+        saved accounts it just starts the game, signed into whatever account the launcher has."""
+        if self._busy or self._phase != "idle":
+            return
+        if self._rl_running or game.process_running("RocketLeague.exe"):
+            self.modal("Play", "Rocket League is already running. Close it first to play on another account.")
+            return
+        cfg = self.cfg
+        row = self._current_account() if self._accounts_state[0] == "ok" else None
+        switch = self._switches(row)
+        method, shortcut = cfg["launch"].get("method", "auto"), rl_shortcut_path(cfg)
+        script, store = switcher_path(cfg), switcher_store(cfg)
+        timeout = int(cfg["launch"]["sign_in_timeout_s"])
+        self._busy = True
+        self._phase = "switch" if switch else "launch"
+        self._launch_until = time.monotonic() + 180
+        self._play_note = None
+
+        def work():
+            how, target = game.resolve_launch(method, shortcut)  # before touching the launcher: fail early
+            message = game.switch_account(script, row["id"], timeout, store) if switch else ""
+            game.start_game(how, target)
+            return message or f"Starting Rocket League through {self._launch_text()}"
+
+        def done(message, err):
+            self._busy = False
+            if err:
+                self._phase = "idle"
+                self._play_note = (viewmodel.LOSS, "Couldn't start", str(err))
+            else:
+                self._phase = "launch"
+                self._launch_until = time.monotonic() + 180
+                self.message(message)
+                QTimer.singleShot(1500, lambda: self.reload_accounts(keep_status=True))
+            self.push()
+
+        self.bg.run(work, done)
+
+    # --- vibrance and settings -------------------------------------------------
+
+    def _set_vibrance(self, pct) -> None:
+        try:
+            pct = max(50, min(100, int(pct)))
+        except (TypeError, ValueError):
+            return
+        self.cfg["vibrance"]["pct"] = pct
+        save_config(self.cfg)
+        self.vibrance.obs_retry_at = 0.0  # push the new value to OBS straight away
+        self.vibrance.tick()
+
+    def _toggle_obs(self, _v=None) -> None:
+        self.cfg["vibrance"]["obs"] = not self.cfg["vibrance"]["obs"]
+        save_config(self.cfg)
+        self.vibrance.obs_retry_at = 0.0
+        self.vibrance.tick()
+
+    def _set_autostart(self, on: bool) -> None:
+        try:
+            set_enabled(on)
+        except OSError as exc:
+            self.modal("Start with Windows", f"Couldn't change the setting:\n{exc}")
+        self.cfg["app"]["start_with_windows"] = is_enabled()
+        save_config(self.cfg)
+
+    def _toggle_setting(self, key) -> None:
+        if key == "start_with_windows":
+            self._set_autostart(not is_enabled())
+            return
+
+    def _set_path(self, v) -> None:
+        if not isinstance(v, dict):
+            return
+        key, value = v.get("key"), str(v.get("value") or "").strip().strip('"')
+        if key != "switcher":
+            return
+        self.cfg["launch"]["switcher"] = value
+        save_config(self.cfg)
+        self.reload_accounts()
+
+    def _browse(self, key) -> None:
+        if key != "switcher":
+            return
+        path, _ = QFileDialog.getOpenFileName(self, "Epic account switcher", str(switcher_path(self.cfg)),
+                                              "PowerShell script (*.ps1)")
+        if path:
+            self._set_path({"key": key, "value": str(Path(path))})
+
+    # --- Rocket League: how Play starts it, and the Stats API (Settings and setup) -------------------------
+
+    def find_game(self) -> list[dict]:
+        """Look for Rocket League (Epic, Steam). Picks the first one found unless the user chose a file."""
+        installs = self._installs_cache = game.find_installs()
+        launch = self.cfg["launch"]
+        if installs and launch.get("method") in ("auto", "epic", "steam") and \
+                launch.get("method") not in [i["method"] for i in installs]:
+            launch["method"] = installs[0]["method"]
+            save_config(self.cfg)
+        return installs
+
+    def _find_game(self, _v=None) -> None:
+        installs = self.find_game()
+        if self._setup:
+            self._setup.update(found=installs, error="" if installs else
+                               "Rocket League wasn't found in Epic Games or Steam. Choose the game or a shortcut yourself.")
+            return
+        if not installs:
+            self.modal("Find Rocket League", "Rocket League wasn't found in Epic Games or Steam.\n\n"
+                                             "Choose the game or a shortcut yourself instead.")
+            return
+        where = "; ".join(f"{'Epic Games' if i['method'] == 'epic' else 'Steam'}: {i['dir']}" for i in installs)
+        self.message(f"Found Rocket League ({where}). Play starts it through {self._launch_text()}.")
+
+    def _set_launch(self, method) -> None:
+        if method in data.LAUNCH_METHODS and method != "path":
+            self.cfg["launch"]["method"] = method
+            save_config(self.cfg)
+
+    def _choose_game(self, _v=None) -> None:
+        """A file dialog for the game's exe or a shortcut to it (.lnk, .url)."""
+        start = rl_shortcut_path(self.cfg)
+        path, _ = QFileDialog.getOpenFileName(self, "Rocket League, or a shortcut to it",
+                                              str(start.parent if start else Path.home() / "Desktop"),
+                                              "Program or shortcut (*.exe *.lnk *.url)")
+        if not path:
+            return
+        problem = game.check_game_file(Path(path))
+        if problem:
+            if self._setup:
+                self._setup["error"] = problem
+            else:
+                self.modal("Rocket League", problem)
+            return
+        self.cfg["launch"].update(rl_shortcut=str(Path(path)), method="path")
+        save_config(self.cfg)
+        if self._setup:
+            self._setup["error"] = ""
+
+    def _enable_stats(self, _v=None) -> None:
+        """Switch the Stats API on in TAStatsAPI.ini (the user clicked Enable). Not while the game runs: it reads
+        the file when it starts and may write it when it closes."""
+        if self._rl_running or game.process_running("RocketLeague.exe"):
+            text = "Close Rocket League first: it reads this setting when it starts."
+            if self._setup:
+                self._setup.update(statsMsg=text, statsOk=False)
+            else:
+                self.modal("Stats API", text)
+            return
+        user_ini, install_ini = self._stats_files()
+        changed, problems = stats.enable_stats_everywhere(user_ini, install_ini)
+        ok = stats.read_stats_api(user_ini)["enabled"]
+        if ok and not problems:
+            text = "Stats API enabled. It starts working the next time you start Rocket League."
+        elif ok:
+            text = ("Stats API enabled for now, but the game folder's copy couldn't be changed, so a game update may "
+                    "switch it off again: " + "; ".join(problems))
+        else:
+            text = "Couldn't switch it on: " + "; ".join(problems)
+        if self._setup:
+            self._setup.update(statsMsg=text, statsOk=ok)
+        elif ok:
+            self.message(text)
+        else:
+            self.modal("Stats API", text)
+
+    # --- first-run setup: Epic name, the game, the Stats API ------------------------------------------------
+
+    SETUP_STEPS = ("profile", "game", "stats", "done")
+
+    def open_setup(self, step: str = "profile") -> None:
+        profile = self.current_profile()
+        try:  # read once here (a few MB of log): the view is rebuilt on every state push
+            log_players = rllog.signed_in_players(self.mmrlog.dir)
+        except OSError:
+            log_players = []
+        self._setup = {"step": step, "name": profile["key"] if profile else "", "error": "", "found": None,
+                       "statsMsg": "", "statsOk": False, "seq": (self._setup or {}).get("seq", 0) + 1,
+                       "logPlayers": log_players}
+        if self._setup["name"] == "" and self._detected_players():
+            self._setup["name"] = self._detected_players()[0][1]
+
+    def _detected_players(self) -> list[tuple[str, str]]:
+        """(account id, name) of Epic accounts seen on this PC: signed into the game (its log, read when setup
+        opened), then saved in the account switcher."""
+        found = list((self._setup or {}).get("logPlayers") or [])
+        for a in self._accounts:
+            if a["id"] and all(a["id"].lower() != acc for acc, _ in found):
+                found.append((a["id"].lower(), a["name"]))
+        return found
+
+    def _setup_profile(self, v) -> None:
+        """Setup step 1: the player's Epic name. A name the game or the switcher knows gets its Epic account id
+        (so the log's readings land on it); any other name makes a profile that takes the id when it first plays."""
+        s = self._setup
+        name = str((v or {}).get("name") or "").strip()
+        if not s:
+            return
+        if not name:
+            s["error"] = "Enter your Epic name (the name other players see in Rocket League)."
+            return
+        if len(name) > 64:
+            s["error"] = "That's longer than an Epic name can be."
+            return
+        known = next((acc for acc, n in self._detected_players() if n.lower() == name.lower()), None)
+        if known:
+            key = data.profile_for_epic_account(known, name)
+        else:
+            key = next((p["key"] for p in data.list_profiles() if p["key"].lower() == name.lower()), None)
+            if key is None:
+                key = name
+                data.upsert_profile(key, None)
+        account = next((a for a in self._accounts if known and a["id"].lower() == known), None)
+        if account:
+            self._pick_account(account["id"])
+        self.reload_profiles(select=key, push=False)
+        s.update(name=key, error="", step="game")
+
+    def _setup_go(self, step) -> None:
+        if self._setup and step in self.SETUP_STEPS:
+            self._setup.update(step=step, error="")
+
+    def _setup_finish(self, _v=None) -> None:
+        self._setup = None
+        if not self.cfg["app"].get("setup_done"):
+            self.cfg["app"]["setup_done"] = True
+            save_config(self.cfg)
+
+    def _setup_view(self) -> dict | None:
+        s = self._setup
+        if not s:
+            return None
+        launch = self.cfg["launch"]
+        api = self._stats_api_state()
+        found = s["found"]
+        return {
+            "step": s["step"], "steps": list(self.SETUP_STEPS[:-1]), "seq": s["seq"], "name": s["name"],
+            "error": s["error"],
+            "detected": [n for _a, n in self._detected_players()],
+            "launch": self._launch_text(), "method": launch.get("method"),
+            "shortcut": launch.get("rl_shortcut") or "",
+            "found": None if found is None else [
+                {"method": i["method"], "label": "Epic Games" if i["method"] == "epic" else "Steam",
+                 "dir": i["dir"], "on": launch.get("method") == i["method"]} for i in found],
+            "apiOn": api["enabled"], "apiExists": api["exists"], "apiPath": str(stats.stats_ini_path()),
+            "apiInstallPath": api.get("install_path", ""),
+            "statsMsg": s["statsMsg"], "statsOk": s["statsOk"], "gameRunning": self._rl_running,
+            "profile": (self.current_profile() or {}).get("key", ""),
+        }
+
+    # --- data ------------------------------------------------------------------
+
+    # --- import history: a one-time paste of tracker.gg's MMR history (rlutils/importer.py) -------------
+
+    def _tracker_id(self, key: str) -> str:
+        """tracker.gg's player id for a profile: confirmed by a pasted tracker.gg profile (tracker.ids), or set
+        by hand in config.json (player_history_id, for your own profiles only)."""
+        cfg = self.cfg["tracker"]
+        override = "" if key in cfg.get("tracked", []) else str(cfg.get("player_history_id") or "").strip()
+        return override or str(cfg["ids"].get(key, "") or "")
+
+    def _tracker_name(self, key: str) -> str:
+        """The Epic name to look the profile up by on tracker.gg: its account's name in the account switcher,
+        else the profile's name."""
+        profile = data.get_profile(key)
+        account = rllog.account_hex(profile["player_id"]) if profile else None
+        row = next((a for a in self._accounts if account and a["id"].lower() == account), None)
+        return (row or {}).get("name") or key
+
+    def open_import(self, key: str | None = None) -> None:
+        """Open the Import history panel for `key`, by default the profile of the account picked on the Play page."""
+        if key is None:
+            account = self._current_account()
+            if not account:
+                self.modal("Import history", "Pick an account on the Play page first: the history goes to its profile.")
+                return
+            key = data.profile_for_epic_account(account["id"], account.get("name") or "")
+        clear = (self._imp or {}).get("clear", 0) + 1
+        self._imp = {"profile": key, "step": "paste", "error": "", "info": "", "clear": clear}
+        self._imp_preview = self._imp_payload = None
+
+    def _import_check(self, v) -> None:
+        """The user pressed Import: check what they pasted. A tracker.gg profile confirms the player (and gives
+        the history link); a history gets a preview to confirm. Nothing is saved here."""
+        imp = self._imp
+        if not imp or imp["step"] != "paste":
+            return
+        key = imp["profile"]
+        profile = data.get_profile(key) or {"player_id": None}
+        try:
+            payload = importer.parse_paste(str((v or {}).get("text") or ""))
+            kind = importer.kind(payload)
+            if kind == "error":
+                raise importer.PasteProblem(importer.error_text(payload))
+            if kind == "profile":
+                found = importer.check_profile(payload, key, profile["player_id"])
+                self.cfg["tracker"]["ids"][key] = found.tracker_id
+                save_config(self.cfg)
+                imp.update(error="", clear=imp["clear"] + 1,
+                           info=f"Confirmed: tracker.gg profile {found.handle} (id {found.tracker_id}). Now step 2: "
+                                "open the MMR history link and paste that page.")
+                return
+            if kind != "history":
+                raise importer.PasteProblem("That JSON isn't a tracker.gg MMR history or profile. Open one of the "
+                                            "links above and copy that page.")
+            self._imp_payload = payload
+            self._imp_preview = self._preview(key, payload)
+            imp.update(step="preview", error="", info="")
+        except importer.PasteProblem as exc:
+            imp.update(error=str(exc), info="")
+
+    def _preview(self, key: str, payload) -> importer.HistoryPreview:
+        tid = self._tracker_id(key)
+        hint = (f"The history link above is for {key}'s confirmed tracker.gg profile (id {tid}); the history itself "
+                "names no player, so that's as far as it can be checked." if tid else "")
+        return importer.preview_history(payload, key, data.all_snapshots(key), hint)
+
+    def _import_confirm(self) -> None:
+        """Save the previewed readings: only new ones; a stored reading is never replaced."""
+        imp = self._imp
+        if not imp or imp["step"] != "preview" or self._imp_payload is None:
+            return
+        key = imp["profile"]
+        try:  # again, against what's stored now (the log may have added readings meanwhile)
+            p = self._preview(key, self._imp_payload)
+        except importer.PasteProblem as exc:
+            imp.update(step="paste", error=str(exc))
+            return
+        added = data.insert_snapshots(key, p.new)
+        parts = [f"{p.stored} were already stored"] if p.stored else []
+        if p.conflicts:
+            parts.append(f"{p.conflicts} differ from readings already stored for the same day and were left as stored")
+        if p.malformed:
+            parts.append(f"{p.malformed} couldn't be read")
+        imp.update(step="done", clear=imp["clear"] + 1,
+                   result=f"Imported {added} reading{'s' if added != 1 else ''} into {key}."
+                          + (f" Of the rest, {'; '.join(parts)}." if parts else ""))
+        self._imp_preview = self._imp_payload = None
+        self.reload_profiles(select=key, push=False)
+
+    def _import_back(self) -> None:
+        if self._imp and self._imp["step"] == "preview":
+            self._imp.update(step="paste", error="")
+            self._imp_preview = None
+
+    def _import_close(self) -> None:
+        self._imp = self._imp_preview = self._imp_payload = None
+
+    def export_history(self) -> None:
+        profile = self.current_profile()
+        if not profile:
+            self.modal("Export", "No profile yet.")
+            return
+        rows = [
+            {
+                "profile": profile["key"], "playlist_id": r["playlist_id"], "playlist": playlist_name(r["playlist_id"]),
+                "recorded_at": r["recorded_at"], "rating": r["rating"],
+                "rank": rank_label(*self._rank_of(r, r["playlist_id"])),
+                "tier_id": r["tier_id"], "division_id": r["division_id"], "source": r["source"],
+            }
+            for r in data.all_snapshots(profile["key"])
+        ]
+        path, selected = QFileDialog.getSaveFileName(self, "Export MMR history", f"{profile['key']}_mmr.csv",
+                                                     "CSV (*.csv);;JSON (*.json)")
+        if not path:
+            return
+        target = Path(path)
+        as_json = target.suffix.lower() == ".json" or (not target.suffix and selected.startswith("JSON"))
+        target = target.with_suffix(".json" if as_json else ".csv")
+        try:
+            if as_json:
+                target.write_text(json.dumps(rows, indent=2), encoding="utf-8")
+            else:
+                with target.open("w", newline="", encoding="utf-8") as f:
+                    writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()) if rows else ["profile"])
+                    writer.writeheader()
+                    writer.writerows(rows)
+        except OSError as exc:
+            self.modal("Export MMR history", f"Couldn't write the file:\n{exc}")
+            return
+        self.message(f"Exported {len(rows)} rows to {target}")
+
+
+def _allow_taskbar_minimize(window) -> None:
+    """A frameless window has no minimize box, so clicking its taskbar button does nothing; add the styles
+    (they draw nothing without a caption)."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        user32 = ctypes.windll.user32
+        user32.GetWindowLongW.restype = ctypes.c_long
+        hwnd = ctypes.c_void_p(int(window.winId()))
+        style = user32.GetWindowLongW(hwnd, -16)  # GWL_STYLE
+        user32.SetWindowLongW(hwnd, -16, style | 0x00020000 | 0x00010000 | 0x00080000)  # MINIMIZEBOX MAXIMIZEBOX SYSMENU
+    except (AttributeError, OSError):
+        pass
+
+
+def main() -> int:
+    if sys.platform == "win32" and not FROZEN:
+        # From source: own taskbar button instead of Python's. The exe sets no ID, so Windows goes by the exe
+        # path, the same as a pinned shortcut to RLUtils.exe; then the pinned button is the one that lights up.
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("RLUtils.App")
+        except (AttributeError, OSError):
+            pass
+    QApplication.setAttribute(Qt.AA_ShareOpenGLContexts)
+    app = QApplication.instance() or QApplication(sys.argv)
+
+    # One app at a time: a second launch asks the running one to show itself (or, with --quit, to quit: the
+    # installer uses it so vibrance is put back before the files are replaced).
+    probe = QLocalSocket()
+    probe.connectToServer(INSTANCE_NAME)
+    if probe.waitForConnected(300):
+        probe.write(b"quit" if "--quit" in sys.argv else b"show")
+        probe.waitForBytesWritten(300)
+        return 0
+    if "--quit" in sys.argv:
+        return 0
+    QLocalServer.removeServer(INSTANCE_NAME)
+    server = QLocalServer()
+    server.listen(INSTANCE_NAME)
+
+    app.setStyle("Fusion")
+    app.setFont(ui.app_font())
+    app.setStyleSheet(ui.QSS)  # dialogs and the tray menu
+    app.setWindowIcon(ui.make_icon())
+    app.setQuitOnLastWindowClosed(False)  # the tray keeps it alive; quit_app/closeEvent end it
+    window = MainWindow(start_hidden="--tray" in sys.argv)
+    app.aboutToQuit.connect(window.vibrance.restore)  # never leave the desktop at Rocket League's vibrance
+    def on_connection():
+        sock = server.nextPendingConnection()
+        sock.waitForReadyRead(300)
+        if bytes(sock.readAll()).startswith(b"quit"):
+            window.quit_app()
+        else:
+            window.show_from_tray()
+
+    server.newConnection.connect(on_connection)
+    if not window.start_hidden:
+        window.show()
+    return app.exec()

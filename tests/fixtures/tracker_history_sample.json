@@ -1,0 +1,28 @@
+{
+  "data": {
+    "11": [
+      {"rating": 462, "collectDate": "2025-12-13T00:00:00+00:00"},
+      {"rating": 463, "collectDate": "2025-12-15T00:00:00+00:00"},
+      {"rating": 450, "collectDate": "2025-12-18T00:00:00+00:00"},
+      {"rating": 522, "collectDate": "2026-01-26T00:00:00+00:00"},
+      {"rating": 584, "collectDate": "2026-02-20T00:00:00+00:00"},
+      {"rating": 670, "collectDate": "2026-03-02T00:00:00+00:00"},
+      {"rating": 863, "collectDate": "2026-03-13T00:00:00+00:00"},
+      {"rating": 726, "collectDate": "2026-04-11T00:00:00+00:00"},
+      {"rating": 910, "collectDate": "2026-05-17T00:00:00+00:00"},
+      {"rating": 888, "collectDate": "2026-08-02T00:00:00+00:00"},
+      {"rating": 874, "collectDate": "2026-09-02T00:00:00+00:00"},
+      {"rating": 854, "collectDate": "2026-10-01T00:00:00+00:00"},
+      {"rating": 998, "collectDate": "2026-10-11T00:00:00+00:00"},
+      {"rating": 1036, "collectDate": "2026-10-17T00:00:00+00:00"}
+    ],
+    "0": [
+      {"rating": 717, "tier": "Unranked", "division": "Division I", "tierId": 0, "divisionId": 0, "collectDate": "2025-12-13T00:00:00+00:00"}
+    ],
+    "13": [
+      {"rating": 600, "collectDate": "not-a-date"},
+      {"collectDate": "2026-01-01T00:00:00+00:00"},
+      {"rating": 640, "collectDate": "2026-06-01T12:00:00"}
+    ]
+  }
+}

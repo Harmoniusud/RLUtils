@@ -1,0 +1,19 @@
+# build output
+build/
+dist/
+*.spec
+__pycache__/
+*.pyc
+
+# your data (never commit): database, settings, saved Epic sign-ins, logs
+data/
+*.db
+config.json
+rllog_state.json
+epic-accounts/
+*.log
+!tests/fixtures/*.log
+
+# local notes and tools
+.claude/
+*.bak
