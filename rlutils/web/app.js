@@ -129,8 +129,23 @@ function mmrPage() {
       <div class="chartbox" id="chart">${chartBody()}</div>
       <div class="ticks">${ticks()}</div>
     </div>
+    ${rankTable()}
   </div>`;
   return h;
+}
+
+// Every rank of the playlist with each division's starting MMR and how far you are from it.
+function rankTable() {
+  const rows = S.mmr.ranks || [];
+  if (!rows.length) return "";
+  let h = `<div class="card ranks">
+    <div class="row" style="justify-content:space-between;margin-bottom:10px;"><div class="lbl">Ranks · ${esc(S.pl.title)}</div><div style="font:500 11px var(--ft);color:#7d7d7d;">MMR each division starts at · <span style="color:#6ccb5f">+ above it</span> · <span style="color:#ff99a4">− to go</span></div></div>`;
+  for (const r of rows) {
+    h += `<div class="rrow${r.here ? " here" : ""}"><div class="rname"><span class="rgem" style="border-color:${r.color}"></span><span style="color:${r.color}">${esc(r.name)}</span></div><div class="rdivs">`;
+    for (const d of r.divs) h += `<div class="rdiv${d.here ? " here" : ""}"${d.here ? ' title="You are here"' : ""}><span class="rl">${esc(d.label)}</span><span class="rv">${d.low}</span><span class="rd" style="color:${d.dColor}">${esc(d.d)}</span></div>`;
+    h += `</div></div>`;
+  }
+  return h + `</div>`;
 }
 
 function chartGeom() {

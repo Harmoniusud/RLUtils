@@ -168,6 +168,33 @@ def chart(rows: list[tuple[datetime, dict]], table: list | None, gran: str) -> d
     return {"points": points, "bands": bands, "divs": divs, "lo": lo, "hi": hi}
 
 
+def rank_table(table: list | None, rating: int | None, rank: tuple | None = None) -> list[dict]:
+    """Every rank of a playlist, highest first, with each division's starting MMR and how far `rating` is from
+    it (+ above it, - still to go). The division marked is `rank` (tier, division) when the reading came with
+    one (the game's own rank), else the one `rating` falls in by the table."""
+    if not table:
+        return []
+    here = tuple(rank) if rank and None not in rank else None
+    if here is None and rating is not None:
+        for tier, div, low, _high in table:
+            if rating >= low:
+                here = (tier, div)
+    tiers: dict[int, list] = {}
+    for tier, div, low, _high in table:
+        tiers.setdefault(tier, []).append((div, low))
+    rows = []
+    for tier in sorted(tiers, reverse=True):
+        divs = []
+        for div, low in sorted(tiers[tier]):
+            d = None if rating is None else rating - low
+            divs.append({"label": "" if len(tiers[tier]) == 1 else f"Div {ROMAN[div] if div < 4 else div + 1}",
+                         "low": low, "d": "" if d is None else ("±0" if d == 0 else sign(d)),
+                         "dColor": MUTED if d is None else WIN if d >= 0 else LOSS, "here": here == (tier, div)})
+        rows.append({"name": TIERS[tier] if tier < len(TIERS) else str(tier), "color": tier_color(tier),
+                     "here": bool(here and here[0] == tier), "divs": divs})
+    return rows
+
+
 def mmr_cards(rows: list[tuple[datetime, dict]], before: int | None, table: list | None,
               games: list[dict]) -> list[dict]:
     """Net change, peak and win rate over the range. before: the last rating before the range (the start

@@ -106,6 +106,18 @@ h1 { margin: 0; font: 600 28px var(--fd); white-space: nowrap; }
 /* MMR */
 .gauge { padding: 14px 16px; display: flex; align-items: center; gap: 14px; }
 .chartbox { position: relative; height: 360px; border-radius: 4px; overflow: hidden; }
+.ranks { padding: 16px; }
+.rrow { display: grid; grid-template-columns: 170px minmax(0, 1fr); align-items: center; gap: 12px; padding: 5px 8px; border-radius: 6px; }
+.rrow:nth-child(odd) { background: rgba(255,255,255,0.018); }
+.rrow.here { background: rgba(182,92,242,0.10); }
+.rname { display: flex; align-items: center; gap: 9px; font: 600 13px var(--ft); white-space: nowrap; }
+.rgem { width: 9px; height: 9px; border: 2px solid; transform: rotate(45deg); border-radius: 2px; flex: none; }
+.rdivs { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px; }
+.rdiv { display: flex; align-items: baseline; gap: 8px; padding: 5px 10px; border-radius: 5px; border: 1px solid transparent; font: 500 12px var(--ft); }
+.rdiv.here { border-color: #B65CF2; background: rgba(182,92,242,0.14); }
+.rdiv .rl { color: #7d7d7d; width: 40px; flex: none; }
+.rdiv .rv { color: #d6d6d6; }
+.rdiv .rd { margin-left: auto; font-weight: 600; }
 .band { position: absolute; left: 0; right: 0; border-top: 1px solid #3d3d3d; }
 .band > div { position: absolute; left: 10px; top: 6px; font: 600 11px var(--ft); }
 .divl { position: absolute; left: 0; right: 0; border-top: 1px dashed #3a3a3a; }

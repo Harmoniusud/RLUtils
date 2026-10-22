@@ -3,7 +3,8 @@
 A small Windows app for Rocket League players.
 
 - **MMR over time**: your ranked MMR (1v1, 2v2, 3v3) straight from Rocket League's servers after a one-time
-  Epic sign-in, with rank bands, a division gauge and history you can import once from tracker.gg.
+  Epic sign-in, with rank bands, a division gauge, a rank table showing how far you are from every rank and
+  division, and history you can import once from tracker.gg.
 - **Games**: every match you finish, with everyone's stats, your playstyle, your teammates, and what your
   wins and losses have in common. From the game's official Stats API.
 - **Play**: starts Rocket League (Epic or Steam, or any shortcut you pick), optionally switching the Epic

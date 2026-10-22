@@ -1208,6 +1208,8 @@ class MainWindow(QMainWindow):
             "grans": [{"id": k, "label": k} for k, _ in GRANULARITIES], "gran": self.gran_key,
             "gauge": gauge, "cards": viewmodel.mmr_cards(in_range, before, table, games), "chart": chart,
             "count": f"{n} point{'s' if n != 1 else ''} · {self.gran_key.lower()}", "empty": empty,
+            "ranks": viewmodel.rank_table(table, last["rating"] if last else None,
+                                          (last.get("tier_id"), last.get("division_id")) if last else None),
         }
         self._vm["top"] = top
         self._vm["pl"] = {"options": [{"id": p, "label": viewmodel.short(p), "more": p not in TRACKED_PLAYLISTS}
