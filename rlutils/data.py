@@ -57,7 +57,7 @@ THRESHOLDS_PATH = DATA_DIR / "rank_thresholds.json"  # rank tables the user impo
 
 # All settings live here so they can be changed in one place.
 DEFAULTS = {
-    # The profile and playlist the app shows (kept under "overlay" from versions that had an overlay).
+    # The profile and playlist the app shows.
     "overlay": {
         "profile": "",          # profile shown; empty = the first one
         "playlist": 11,         # playlist shown: 10 = 1v1, 11 = 2v2, 13 = 3v3
@@ -77,6 +77,12 @@ DEFAULTS = {
         "dir": "",
         "every_s": 5,
     },
+    # Live MMR from Rocket League's servers (rlutils/psynet.py) for the Epic accounts signed in (epic_login.dat
+    # in the data folder, encrypted for this Windows user). `asked`: accounts / "start" already offered sign-in.
+    "psynet": {
+        "every_min": 30,
+        "asked": [],
+    },
     # Play: switch the Epic launcher to the picked account (when accounts are saved), then start Rocket League.
     # `method`: "auto" (Epic if installed there, else Steam; found at each start), "epic", "steam", or "path"
     # (`rl_shortcut`: an exe, .lnk or .url the user picked). `switcher`: "" = the switcher built into the app
@@ -87,7 +93,7 @@ DEFAULTS = {
         "switcher": "",
         "account": "",          # Epic account id last picked on the Play page
         "sign_in_timeout_s": 90,
-        "migrated": False,      # migrate_config ran (settings from before 0.11 made explicit)
+        "migrated": False,      # migrate_config ran
     },
     # Desktop app behaviour.
     # Vibrance while Rocket League is in front: NVIDIA Digital Vibrance (50 = the driver default, 100 = max),
@@ -115,6 +121,8 @@ DEFAULTS = {
         "close_to_tray": False,        # True: closing the window keeps the app (and the MMR log reader) in the tray
         "start_with_windows": False,    # mirrored to HKCU\...\Run when changed in Settings
         "setup_done": False,            # the first-run setup was finished (Settings > Run setup again reopens it)
+        "check_updates": True,          # ask GitHub for the newest release at start and once a day
+        "skip_version": "",             # a release the user dismissed: not shown again
     },
     # Matches more than this many minutes apart count as separate sessions (older data only).
     "session_gap_min": 30,
@@ -128,9 +136,9 @@ OBSOLETE_SUBKEYS = {
                 "tilt_enabled", "tilt_loss_streak", "tilt_mmr_drop", "position", "opacity", "margin",
                 "always_show", "font_size", "hotkey"),
     "app": ("auto_overlay",),
-    "launch": ("with_shift",),  # Shift integration (removed in 0.9)
+    "launch": ("with_shift",),
     "vibrance": ("mode", "lens_strength", "lens_hz"),  # the window lens (removed: too much display lag)
-    "tracker": ("profile", "every_min", "hidden_wait_s", "captcha_wait_s"),  # tracker.gg fetching (removed in 0.10)
+    "tracker": ("profile", "every_min", "hidden_wait_s", "captcha_wait_s"),
 }
 
 BUNDLED_SWITCHER = Path(__file__).resolve().parent / "assets" / "EpicSwitcher.ps1"
@@ -232,9 +240,10 @@ def save_config(cfg: dict) -> None:
 SOURCE_TRACKER_IMPORT = "tracker_import"  # recorded snapshot from a Tracker history export
 SOURCE_CURRENT = "kmdw_current"           # reading from the current-MMR API
 SOURCE_MANUAL = "manual"                  # MMR the user typed in (e.g. from the in-game display)
-SOURCE_SCREEN = "screen"                  # MMR read from the in-game display by OCR (until 0.7; no longer made)
+SOURCE_SCREEN = "screen"                  # MMR read from the in-game display by OCR (old data only)
 SOURCE_SHIFT = "shift"                    # MMR shown by Shift (its tracker.ini or its Tracker > Match card)
 SOURCE_RL_LOG = "rl_log"                  # MMR from Rocket League's Launch.log when you queue (rllog.py)
+SOURCE_PSYNET = "psynet"                  # MMR read live from Rocket League's servers after an Epic sign-in (psynet.py)
 USER_SOURCES = (SOURCE_MANUAL, SOURCE_SCREEN, SOURCE_SHIFT)  # readings that settle matches waiting for MMR
 
 
@@ -878,6 +887,33 @@ def set_profile_player(key: str, player_id: str | None, path: Path | None = None
         conn.execute("UPDATE profiles SET player_id = ? WHERE key = ?", (player_id, key))
 
 
+PROFILE_TABLES = ("mmr_snapshots", "matches", "screen_reads", "games")
+PROFILE_RENAMED: list = []  # callbacks (old key, new key) after profile_for_epic_account repaired a name
+
+
+def looks_garbled(name: str) -> bool:
+    """A name that went through a non-UTF-8 step: '?' or U+FFFD where letters were (Epic names can't hold
+    either)."""
+    return chr(0xFFFD) in name or "?" in name
+
+
+def rename_profile(old: str, new: str, path: Path | None = None) -> bool:
+    """Give a profile a new key, moving everything stored under it. False when `new` is taken or `old` is gone."""
+    new = new.strip()
+    if not new or new == old:
+        return False
+    with closing(connect(path)) as conn, conn:
+        row = conn.execute("SELECT player_id, created_at FROM profiles WHERE key = ?", (old,)).fetchone()
+        if row is None or conn.execute("SELECT 1 FROM profiles WHERE key = ?", (new,)).fetchone():
+            return False
+        conn.execute("INSERT INTO profiles (key, player_id, created_at) VALUES (?, ?, ?)",
+                     (new, row["player_id"], row["created_at"]))
+        for table in PROFILE_TABLES:
+            conn.execute(f"UPDATE {table} SET profile_key = ? WHERE profile_key = ?", (new, old))
+        conn.execute("DELETE FROM profiles WHERE key = ?", (old,))
+    return True
+
+
 def list_profiles(path: Path | None = None) -> list[dict]:
     with closing(connect(path)) as conn:
         rows = conn.execute("SELECT key, player_id FROM profiles ORDER BY key").fetchall()
@@ -891,6 +927,11 @@ def profile_for_epic_account(account_id: str, name: str, path: Path | None = Non
     profiles = list_profiles(path)
     for p in profiles:
         if (p["player_id"] or "").lower() == player_id.lower():
+            clean = name.strip()
+            if clean and looks_garbled(p["key"]) and not looks_garbled(clean) and rename_profile(p["key"], clean, path):
+                for hook in PROFILE_RENAMED:  # the app moves its settings for the profile along
+                    hook(p["key"], clean)
+                return clean
             return p["key"]
     unclaimed = next((p for p in profiles if not p["player_id"] and name.strip()
                       and p["key"].lower() == name.strip().lower()), None)

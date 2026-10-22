@@ -21,6 +21,10 @@ Python
 websocket-client
   License: Apache License 2.0, see licenses\websocket-client-Apache-2.0.txt.
 
+rlapi (github.com/dank/rlapi), ported to Python in rlutils\psynet.py
+  License: MIT, see licenses\rlapi-MIT.txt.
+  Copyright (c) 2025 dank.
+
 Not bundled, used if present on your PC:
   - NVIDIA's NVAPI (nvapi64.dll, part of the NVIDIA graphics driver) for the vibrance setting.
   - The Epic Games Launcher and Rocket League themselves.

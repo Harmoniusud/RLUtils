@@ -1,6 +1,6 @@
-"""Desktop app: the MMR-over-time chart (fed by Rocket League's own log, plus a one-time import of tracker.gg's
-history), the Games tracker (fed by Rocket League's Stats API), launching Rocket League on a chosen Epic account,
-settings and start with Windows.
+"""Desktop app: the MMR-over-time chart (fed live by Rocket League's servers after an Epic sign-in, by the game's
+log, and by a one-time import of tracker.gg's history), the Games tracker (fed by Rocket League's Stats API),
+launching Rocket League on a chosen Epic account, settings, an update check and start with Windows.
 """
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ import queue
 import sys
 import threading
 import time
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -18,11 +19,13 @@ from PySide6.QtCore import QEvent, QObject, QTimer, QUrl, Qt, Signal, Slot
 from PySide6.QtGui import QAction, QColor, QDesktopServices
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWebChannel import QWebChannel
-from PySide6.QtWebEngineCore import QWebEnginePage
+from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile
 from PySide6.QtWebEngineWidgets import QWebEngineView
-from PySide6.QtWidgets import QApplication, QFileDialog, QMainWindow, QMenu, QSystemTrayIcon
+from PySide6.QtWidgets import (
+    QApplication, QDialog, QFileDialog, QLabel, QMainWindow, QMenu, QSystemTrayIcon, QVBoxLayout,
+)
 
-from . import data, game, importer, rllog, stats, ui, vibrance, viewmodel
+from . import data, game, importer, psynet, rllog, stats, ui, vibrance, viewmodel
 from .data import (
     APP_NAME, DATA_DIR, DB_PATH, FROZEN, ROOT, SOURCE_RL_LOG, THRESHOLDS_PATH, TRACKED_PLAYLISTS, VERSION,
     load_config, load_thresholds, playlist_name, rank_label, tier_distance, rl_shortcut_path, save_config,
@@ -30,7 +33,7 @@ from .data import (
 )
 from .ui import Background
 
-UI_NAME = APP_NAME  # the name the window shows (it said "RL Tracker", the design's name, in 0.9-0.10)
+UI_NAME = APP_NAME
 
 
 # ====================================================================================================
@@ -42,7 +45,7 @@ UI_NAME = APP_NAME  # the name the window shows (it said "RL Tracker", the desig
 
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 VALUE = "RLUtils"
-OLD_VALUE = "RLTracker"  # the name before 0.8; removed when the setting changes
+OLD_VALUE = "RLTracker"  # an older name of the app, removed when the setting changes
 
 
 def command() -> str:
@@ -157,6 +160,200 @@ class LogWatcher(QObject):
         self._status("ok", "Watching Rocket League's log")
         if result.saved:
             self.saved.emit(result.last[0], result.saved)
+
+
+RELEASES_API = "https://api.github.com/repos/Harmoniusud/RLUtils/releases/latest"
+
+
+def version_tuple(text: str) -> tuple[int, ...]:
+    """'v0.11.1' -> (0, 11, 1); () when it isn't a version."""
+    parts = str(text or "").strip().lstrip("vV").split(".")
+    return tuple(int(p) for p in parts) if all(p.isdigit() for p in parts) and parts != [""] else ()
+
+
+class UpdateChecker(QObject):
+    """Asks GitHub for the newest RLUtils release when the app starts and once a day. Only reads the release's
+    version and page link; nothing is downloaded or installed, and nothing about this PC is sent."""
+
+    found = Signal()
+
+    def __init__(self, window: "MainWindow"):
+        super().__init__(window)
+        self.window = window
+        self.bg = Background(self)
+        self.latest: dict | None = None   # {"version", "url"} of a release newer than this one
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.check)
+
+    def start(self) -> None:
+        self.timer.start(24 * 3600 * 1000)
+        QTimer.singleShot(10_000, self.check)
+
+    def check(self) -> None:
+        if not self.window.cfg["app"].get("check_updates", True):
+            return
+
+        def work():
+            req = urllib.request.Request(RELEASES_API, headers={"Accept": "application/vnd.github+json",
+                                                                "User-Agent": f"RLUtils/{VERSION}"})
+            with urllib.request.urlopen(req, timeout=15) as r:
+                return json.loads(r.read())
+
+        self.bg.run(work, self._done)
+
+    def _done(self, release, err) -> None:
+        if err or not isinstance(release, dict) or release.get("draft") or release.get("prerelease"):
+            return  # offline or GitHub unreachable: try again tomorrow
+        tag = str(release.get("tag_name") or "")
+        if version_tuple(tag) > version_tuple(VERSION):
+            self.latest = {"version": tag.lstrip("vV"),
+                           "url": release.get("html_url") or "https://github.com/Harmoniusud/RLUtils/releases"}
+            self.found.emit()
+
+
+PRIVACY_TEXT = ("Your Epic login stays on this PC. You sign in on Epic's own page, so RLUtils never sees or stores "
+                "your password. What it keeps is Epic's sign-in token, encrypted with Windows so only your Windows "
+                "user on this PC can read it. That token is only ever sent to Epic and Rocket League's own servers, "
+                "to read your MMR. RLUtils has no server of its own and nobody else, including the developer, can "
+                "ever access your login.")
+
+
+class PsyNetWatcher(QObject):
+    """Live MMR from Rocket League's servers (psynet.py) for every Epic account signed in here: when the app
+    starts, when Rocket League closes (so the last match counts), and every `psynet.every_min` minutes while
+    it isn't running. Never while it runs: signing into PsyNet beside the game could drop the game's session;
+    the log watcher covers that time."""
+
+    saved = Signal(str, int)    # profile key, new readings
+    status = Signal()
+
+    def __init__(self, window: "MainWindow"):
+        super().__init__(window)
+        self.window = window
+        self.bg = Background(self)
+        self.store = psynet.LoginStore(DATA_DIR / "epic_login.dat")
+        self.version = psynet.Version(DATA_DIR / "psynet_version.json")
+        self.busy = False
+        self.state = ("wait", "Starting")
+        self.last_at: datetime | None = None
+        self.expired: set[str] = set()   # accounts whose sign-in stopped working: asked to sign in again
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.tick)
+
+    def accounts(self) -> list[tuple[str, str]]:
+        return self.store.accounts()
+
+    def start(self) -> None:
+        self.timer.start(max(5, int(self.window.cfg["psynet"].get("every_min", 30))) * 60_000)
+        QTimer.singleShot(3000, self.tick)
+
+    def _status(self, state: str, text: str) -> None:
+        if (state, text) != self.state:
+            self.state = (state, text)
+            self.status.emit()
+
+    def tick(self) -> None:
+        if self.busy:
+            return
+        if not self.accounts():
+            self._status("off", "Not signed in to Epic")
+            return
+        if self.window._rl_running:
+            self._status("paused", "Paused while Rocket League runs (MMR comes from its log meanwhile)")
+            return
+        self.busy = True
+        self._status("busy", "Reading MMR from Rocket League's servers…")
+        self.bg.run(self._work, self._done)
+
+    def _work(self):
+        results, errors, expired = [], [], []
+        for account, name in self.accounts():
+            try:
+                f = psynet.fetch_skills(self.store, account, self.version)
+                results.append(psynet.save(f, TRACKED_PLAYLISTS))
+            except psynet.LoginExpired:
+                expired.append((account, name))
+            except Exception as exc:  # one account failing must not stop the others
+                errors.append(f"{name or account[:6]}: {exc}")
+        return results, errors, expired
+
+    def _done(self, res, err) -> None:
+        self.busy = False
+        if err:
+            self._status("error", str(err))
+            return
+        results, errors, expired = res
+        self.last_at = datetime.now(timezone.utc)
+        for key, added in results:
+            if added:
+                self.saved.emit(key, added)
+        if errors:
+            self._status("error", "; ".join(errors))
+        else:
+            self._status("ok", f"Live from Rocket League's servers · checked {self.last_at.astimezone():%H:%M}")
+        for account, name in expired:
+            if account not in self.expired:
+                self.expired.add(account)
+                self.window.ask_epic_login(again=name or account[:6])
+
+
+class EpicLoginDialog(QDialog):
+    """Epic's own login page in a window. When the page reaches Epic's redirect page it shows a one-time
+    authorization code: it is traded for a refresh token (psynet.login_with_code), which is saved encrypted.
+    The page runs in a private browser profile, so no Epic cookies are left behind either."""
+
+    signed_in = Signal(str, str)  # account id, Epic name
+
+    def __init__(self, parent: "MainWindow", store: psynet.LoginStore):
+        super().__init__(parent)
+        self.store = store
+        self.bg = Background(self)
+        self.setWindowTitle("Sign in to Epic Games")
+        self.resize(520, 760)
+        self.profile = QWebEngineProfile(self)  # off the record: nothing is written to disk
+        self.view = QWebEngineView(self)
+        self.view.setPage(QWebEnginePage(self.profile, self.view))
+        self.note = QLabel("Sign in on Epic's own page below. " + PRIVACY_TEXT, self)
+        self.note.setWordWrap(True)
+        self.note.setStyleSheet("padding:10px 12px;color:#d6d6d6;background:#262626;font-size:12px;")
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+        lay.addWidget(self.note)
+        lay.addWidget(self.view, 1)
+        self._got = False
+        self.view.loadFinished.connect(self._check)
+        self.view.load(QUrl(psynet.LOGIN_URL))
+
+    def _check(self, _ok) -> None:
+        if self._got or not self.view.url().toString().startswith(psynet.REDIRECT_PREFIX):
+            return
+        self.view.page().toPlainText(self._got_text)
+
+    def _got_text(self, text: str) -> None:
+        code = psynet.code_from_redirect_text(text)
+        if not code:  # the redirect page without a code: not signed in yet
+            self.view.load(QUrl(psynet.LOGIN_URL))
+            return
+        self._got = True
+        self.note.setText("Signed in. Saving…")
+
+        def work():
+            tok = psynet.login_with_code(code)
+            self.store.put(tok["account_id"], tok.get("displayName", ""), tok["refresh_token"],
+                           tok.get("refresh_expires_at", ""))
+            return tok["account_id"].lower(), tok.get("displayName", "")
+
+        def finished(res, err):
+            if err:
+                self.note.setText(f"Couldn't finish signing in: {err}. Try again.")
+                self._got = False
+                self.view.load(QUrl(psynet.LOGOUT_URL))
+                return
+            self.signed_in.emit(*res)
+            self.accept()
+
+        self.bg.run(work, finished)
 
 
 class VibranceWatcher(QObject):
@@ -436,9 +633,12 @@ class MainWindow(QMainWindow):
     all drawn by the page. Python keeps the state and does the work; the page shows it and sends clicks."""
 
     PAGES = ["MMR", "Games", "Play", "Settings"]
+    profile_renamed = Signal(str, str)  # old key, new key (emitted from any thread; handled on the UI thread)
 
     def __init__(self, start_hidden: bool = False):
         super().__init__()
+        self.profile_renamed.connect(self._on_profile_renamed)
+        data.PROFILE_RENAMED.append(self.profile_renamed.emit)
         self.setWindowTitle(APP_NAME)
         self.setWindowIcon(ui.make_icon())
         self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint)
@@ -500,12 +700,22 @@ class MainWindow(QMainWindow):
         self.games = GamesWatcher(self)
         self.games.status.connect(lambda _s, _t: self.push())
         self.games.saved.connect(self._on_game_saved)
+        self.live = PsyNetWatcher(self)
+        self.live.status.connect(self.push)
+        self.live.saved.connect(self._on_live_saved)
+        self._epic_dialog: EpicLoginDialog | None = None
+        self.updates = UpdateChecker(self)
+        self.updates.found.connect(self.push)
         self.mmrlog.start()
         self.vibrance.start()
         self.games.start()
+        self.live.start()
+        self.updates.start()
         self.reload_accounts()
         if not self.cfg["app"].get("setup_done"):
-            self.open_setup()  # first start: Epic name, the game, the Stats API
+            self.open_setup()  # first start: Epic name, Epic sign-in, the game, the Stats API
+        elif not self.live.accounts() and self._offer_once("start"):
+            QTimer.singleShot(1500, self.ask_epic_login)  # offered once
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._poll)
@@ -547,6 +757,10 @@ class MainWindow(QMainWindow):
             "setupProfile": self._setup_profile, "setupGo": self._setup_go, "setupFinish": self._setup_finish,
             "findGame": self._find_game, "chooseGame": self._choose_game, "setLaunch": self._set_launch,
             "enableStats": self._enable_stats,
+            "epicLogin": lambda _v: self.open_epic_login(), "epicLogout": self._epic_logout,
+            "liveRefresh": lambda _v: self.live.tick(),
+            "updateOpen": lambda _v: self.updates.latest and QDesktopServices.openUrl(QUrl(self.updates.latest["url"])),
+            "updateSkip": self._skip_update,
             "setVibrance": self._set_vibrance, "toggleObs": self._toggle_obs,
             "toggle": self._toggle_setting, "setPath": self._set_path, "browse": self._browse,
             "import": lambda _v: self.open_import(),
@@ -881,6 +1095,7 @@ class MainWindow(QMainWindow):
             self._play_note = None
         elif not self._rl_running and self._phase == "running":
             self._phase = "idle"
+            QTimer.singleShot(20_000, self.live.tick)  # the game closed: read the MMR its last match left
         elif self._phase == "launch" and time.monotonic() > self._launch_until:
             self._phase = "idle"
             self._play_note = (viewmodel.WARN, "Rocket League didn't start",
@@ -1010,6 +1225,7 @@ class MainWindow(QMainWindow):
             "log": self._log_view(), "imp": self._import_view(), "setup": self._setup_view(),
             "api": self._api_view(), "play": self._play_view(),
             "settings": self._settings_view(profile), "status": self._status_view(), "tray": self._tray_items(),
+            "update": self._update_view(),
         }
 
     def _log_view(self) -> dict:
@@ -1037,7 +1253,101 @@ class MainWindow(QMainWindow):
         v["full"] = f"{text}. {v['detail']}" if v["detail"] != text else text
         v["note"] = ("Your MMR is read from Rocket League's log each time you queue ranked, so a match's change "
                      "shows when you queue the next one. Readings from a party someone else leads aren't saved.")
+        v["live"] = self._live_view()
         return v
+
+    def _live_view(self) -> dict:
+        state, text = self.live.state
+        color = {"ok": viewmodel.WIN, "busy": viewmodel.WARN, "paused": viewmodel.WARN,
+                 "error": viewmodel.LOSS}.get(state, viewmodel.FAINT)
+        names = ", ".join(n or a[:6] for a, n in self.live.accounts())
+        title = {"ok": "Live MMR", "busy": "Live MMR · checking", "paused": "Live MMR · paused",
+                 "error": "Live MMR · couldn't read it", "off": "Live MMR is off"}.get(state, "Live MMR")
+        detail = (text + (f" · {names}" if names else "")) if state != "off" else \
+            "Sign in to Epic once and your MMR for every ranked playlist comes straight from Rocket League's servers."
+        return {"on": bool(names), "busy": state == "busy", "color": color, "title": title, "detail": detail,
+                "short": {"ok": "live", "busy": "checking", "paused": "paused", "error": "error"}.get(state, "off")}
+
+    def _epic_rows(self) -> list[dict]:
+        return [{"id": a, "name": n or a[:6]} for a, n in self.live.accounts()]
+
+    # --- live MMR: the Epic sign-in (psynet.py) ------------------------------------------------------------
+
+    def _offer_once(self, what: str) -> bool:
+        """True the first time sign-in is offered for `what` (an account id, or "start"); remembered."""
+        asked = self.cfg["psynet"].setdefault("asked", [])
+        if what.lower() in asked:
+            return False
+        asked.append(what.lower())
+        save_config(self.cfg)
+        return True
+
+    def ask_epic_login(self, again: str | None = None) -> None:
+        if self._epic_dialog is not None:
+            return
+        if again:
+            title = "Sign in to Epic again"
+            lead = (f"The saved Epic sign-in for {again} stopped working (it wasn't used for a long time, or the "
+                    "password changed). Sign in once more to keep live MMR.")
+        else:
+            title = "Live MMR"
+            lead = ("Sign in to Epic once and RLUtils reads your current MMR for every ranked playlist straight "
+                    "from Rocket League's servers. You won't be asked again.")
+        self.modal(title, f"{lead}\n\n{PRIVACY_TEXT}",
+                   [{"label": "Not now"}, {"label": "Sign in with Epic", "a": "epicLogin", "primary": True}])
+
+    def open_epic_login(self) -> None:
+        if self._epic_dialog is not None:
+            self._epic_dialog.raise_()
+            self._epic_dialog.activateWindow()
+            return
+        dlg = self._epic_dialog = EpicLoginDialog(self, self.live.store)
+
+        def signed_in(account: str, name: str) -> None:
+            self.live.expired.discard(account)
+            self._offer_once(account)
+            self.message(f"Signed in to Epic as {name or account[:6]}: reading live MMR")
+            self.live.tick()
+            self.push()
+
+        def closed(_r) -> None:
+            self._epic_dialog = None
+            dlg.deleteLater()
+            self.push()
+
+        dlg.signed_in.connect(signed_in)
+        dlg.finished.connect(closed)
+        dlg.show()
+
+    def _epic_logout(self, account) -> None:
+        account = str(account or "")
+        self.live.store.remove(account)
+        self.live.expired.discard(account)
+        self.message("Signed out: the saved Epic sign-in was deleted from this PC")
+        self.live.tick()
+
+    def _on_profile_renamed(self, old: str, new: str) -> None:
+        """A profile saved under a garbled name got its real one (data.profile_for_epic_account): move the
+        settings that name it along."""
+        cfg = self.cfg
+        if cfg["overlay"]["profile"] == old:
+            cfg["overlay"]["profile"] = new
+        ids = cfg["tracker"].setdefault("ids", {})
+        if old in ids:
+            ids[new] = ids.pop(old)
+        tracked = cfg["tracker"].setdefault("tracked", [])
+        cfg["tracker"]["tracked"] = [new if k == old else k for k in tracked]
+        save_config(cfg)
+        if self.profile_key == old:
+            self.profile_key = new
+        self.reload_profiles(select=self.profile_key)
+
+    def _on_live_saved(self, profile_key: str, added: int) -> None:
+        self.message(f"Live MMR: {added} new reading{'s' if added != 1 else ''} for {profile_key}")
+        if self.profile_key is None:
+            self.reload_profiles(select=profile_key)
+        else:
+            self.refresh()
 
     def _import_view(self) -> dict | None:
         imp = self._imp
@@ -1159,6 +1469,9 @@ class MainWindow(QMainWindow):
             "toggles": [
                 {"key": "start_with_windows", "label": "Start with Windows", "on": is_enabled(),
                  "sub": "Launch minimized when you sign in"},
+                {"key": "check_updates", "label": "Check for updates",
+                 "on": bool(self.cfg["app"].get("check_updates", True)),
+                 "sub": "Once a day, ask GitHub whether a newer RLUtils is out (nothing is installed by itself)"},
             ],
             "paths": [
                 {"key": "switcher", "label": "Account switcher", "value": launch["switcher"],
@@ -1167,6 +1480,7 @@ class MainWindow(QMainWindow):
             "rl": self._rl_view(),
             "data": f"{DB_PATH.name} · {size} · {readings:,} readings · {len(self._games_all):,} games",
             "dataDir": str(DATA_DIR),
+            "epic": self._epic_rows(), "privacy": PRIVACY_TEXT,
         }
 
     def _installs(self) -> list[dict]:
@@ -1226,6 +1540,11 @@ class MainWindow(QMainWindow):
                 return
             self._accounts = rows
             self._accounts_state = ("ok", "")
+            signed = {a for a, _n in self.live.accounts()}
+            new = [r for r in rows if r["id"] and r["id"].lower() not in signed and self.cfg["app"].get("setup_done")
+                   and self._offer_once(r["id"])]
+            if new:  # an account added to the switcher: offer live MMR for it, once
+                QTimer.singleShot(500, self.ask_epic_login)
             self._accounts_at = datetime.now(timezone.utc)
             if not self._current_account():
                 active = next((r["id"] for r in rows if r["active"]), "")
@@ -1391,6 +1710,25 @@ class MainWindow(QMainWindow):
         if key == "start_with_windows":
             self._set_autostart(not is_enabled())
             return
+        if key == "check_updates":
+            on = not self.cfg["app"].get("check_updates", True)
+            self.cfg["app"]["check_updates"] = on
+            save_config(self.cfg)
+            if on:
+                self.updates.check()
+            else:
+                self.updates.latest = None
+
+    def _skip_update(self, _v=None) -> None:
+        if self.updates.latest:
+            self.cfg["app"]["skip_version"] = self.updates.latest["version"]
+            save_config(self.cfg)
+
+    def _update_view(self) -> dict | None:
+        u = self.updates.latest
+        if not u or u["version"] == self.cfg["app"].get("skip_version"):
+            return None
+        return {"version": u["version"], "url": u["url"]}
 
     def _set_path(self, v) -> None:
         if not isinstance(v, dict):
@@ -1489,7 +1827,7 @@ class MainWindow(QMainWindow):
 
     # --- first-run setup: Epic name, the game, the Stats API ------------------------------------------------
 
-    SETUP_STEPS = ("profile", "game", "stats", "done")
+    SETUP_STEPS = ("profile", "epic", "game", "stats", "done")
 
     def open_setup(self, step: str = "profile") -> None:
         profile = self.current_profile()
@@ -1537,7 +1875,7 @@ class MainWindow(QMainWindow):
         if account:
             self._pick_account(account["id"])
         self.reload_profiles(select=key, push=False)
-        s.update(name=key, error="", step="game")
+        s.update(name=key, error="", step="epic")
 
     def _setup_go(self, step) -> None:
         if self._setup and step in self.SETUP_STEPS:
@@ -1545,6 +1883,7 @@ class MainWindow(QMainWindow):
 
     def _setup_finish(self, _v=None) -> None:
         self._setup = None
+        self._offer_once("start")  # setup offered the Epic sign-in: not asked again at the next start
         if not self.cfg["app"].get("setup_done"):
             self.cfg["app"]["setup_done"] = True
             save_config(self.cfg)
@@ -1569,6 +1908,7 @@ class MainWindow(QMainWindow):
             "apiInstallPath": api.get("install_path", ""),
             "statsMsg": s["statsMsg"], "statsOk": s["statsOk"], "gameRunning": self._rl_running,
             "profile": (self.current_profile() or {}).get("key", ""),
+            "epic": self._epic_rows(), "privacy": PRIVACY_TEXT,
         }
 
     # --- data ------------------------------------------------------------------

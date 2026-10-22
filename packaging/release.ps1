@@ -2,8 +2,7 @@
 #   powershell -ExecutionPolicy Bypass -File packaging\release.ps1
 # Writes dist\RLUtils-<version>.zip with only: the built app (dist\RLUtils), README.txt (packaging\README-user.txt),
 # THIRD_PARTY_NOTICES.txt, the licenses folder, and LICENSE.txt if the project has one. Nothing from data\,
-# tools\, HANDOFF*.md or other dev folders can end up in it. (Up to 0.10 this also wrote an update feed,
-# latest.json; the app doesn't read one any more.)
+# tools\, HANDOFF*.md or other dev folders can end up in it.
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 $version = (python -c "import sys; sys.path.insert(0, r'$root'); import rlutils; print(rlutils.__version__)").Trim()

@@ -17,6 +17,10 @@ param([switch]$NoGui, [switch]$ListJson, [string]$SwitchTo = '', [int]$WaitSignI
 
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Security
+# Print UTF-8: with no console (how RLUtils runs it) Windows PowerShell would print the OEM code page, turning
+# names like 'ä' or '★' into '?'.
+[Console]::OutputEncoding = New-Object Text.UTF8Encoding($false)
+$OutputEncoding = [Console]::OutputEncoding
 
 if (-not $StoreDir) { $StoreDir = Join-Path $PSScriptRoot 'accounts' }
 $StatePath  = Join-Path $StoreDir 'state.json'
@@ -116,7 +120,7 @@ function Set-IniValue($Ini, [string]$Section, [string]$Key, [string]$Value) {
 
 function Get-Profiles {
     Get-ChildItem $StoreDir -Filter '*.json' | Where-Object { $_.Name -ne 'state.json' } | ForEach-Object {
-        Get-Content $_.FullName -Raw | ConvertFrom-Json
+        Get-Content $_.FullName -Raw -Encoding UTF8 | ConvertFrom-Json
     } | Sort-Object Name
 }
 
@@ -127,7 +131,7 @@ function Save-Profile($ProfileObj) {
 }
 
 function Get-State {
-    if (Test-Path $StatePath) { Get-Content $StatePath -Raw | ConvertFrom-Json } else { [pscustomobject]@{ Current = $null; SwitchedAt = $null } }
+    if (Test-Path $StatePath) { Get-Content $StatePath -Raw -Encoding UTF8 | ConvertFrom-Json } else { [pscustomobject]@{ Current = $null; SwitchedAt = $null } }
 }
 
 function Set-State([string]$Current) {
@@ -186,7 +190,7 @@ function Save-CurrentAccount {
     $id = Resolve-CurrentAccountId $login
     if (-not $id) { return $null }
     $path = Get-ProfilePath $id
-    $existing = if (Test-Path $path) { Get-Content $path -Raw | ConvertFrom-Json } else { $null }
+    $existing = if (Test-Path $path) { Get-Content $path -Raw -Encoding UTF8 | ConvertFrom-Json } else { $null }
     $name = if ($existing) { $existing.Name } else { $n = Find-DisplayName $id; if ($n) { $n } else { "Account $($id.Substring(0, 6))" } }
     $data = [ordered]@{}
     foreach ($key in $login.Values.Keys) { $data[$key] = Protect-Text $login.Values[$key] }
@@ -244,10 +248,10 @@ function Write-LoginToIni([hashtable]$Values) {
 }
 
 function Switch-Account([string]$Id, [switch]$PlayRocketLeague) {
-    $target = Get-Content (Get-ProfilePath $Id) -Raw | ConvertFrom-Json
+    $target = Get-Content (Get-ProfilePath $Id) -Raw -Encoding UTF8 | ConvertFrom-Json
     Stop-Launcher
     Save-CurrentAccount | Out-Null       # keep the outgoing account's newest token
-    $target = Get-Content (Get-ProfilePath $Id) -Raw | ConvertFrom-Json
+    $target = Get-Content (Get-ProfilePath $Id) -Raw -Encoding UTF8 | ConvertFrom-Json
     $values = @{}
     foreach ($p in $target.Data.PSObject.Properties) { $values[$p.Name] = Unprotect-Text $p.Value }
     Write-LoginToIni $values
@@ -278,7 +282,7 @@ if ($SwitchTo) {
     try {
         $path = Get-ProfilePath $SwitchTo
         if (-not (Test-Path $path)) { "No saved account with id $SwitchTo."; exit 2 }
-        $name = (Get-Content $path -Raw | ConvertFrom-Json).Name
+        $name = (Get-Content $path -Raw -Encoding UTF8 | ConvertFrom-Json).Name
         $started = [DateTime]::UtcNow.AddSeconds(-1)
         Switch-Account $SwitchTo
         if ($WaitSignIn -gt 0) {
@@ -443,7 +447,7 @@ New-Button 'Rename' {
     $id = Get-SelectedId
     if (-not $id) { $status.Text = 'Pick an account first.'; return }
     Add-Type -AssemblyName Microsoft.VisualBasic
-    $p = Get-Content (Get-ProfilePath $id) -Raw | ConvertFrom-Json
+    $p = Get-Content (Get-ProfilePath $id) -Raw -Encoding UTF8 | ConvertFrom-Json
     $new = [Microsoft.VisualBasic.Interaction]::InputBox('New name:', 'Rename account', $p.Name)
     if ($new.Trim()) { $p.Name = $new.Trim(); Save-Profile $p; Refresh-List "Renamed to $($p.Name)." }
 } | Out-Null
