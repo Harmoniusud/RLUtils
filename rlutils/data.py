@@ -7,6 +7,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import re
 import sqlite3
 import sys
 from contextlib import closing
@@ -70,15 +71,8 @@ DEFAULTS = {
         "ids": {},              # profile key -> tracker.gg player id
         "tracked": [],          # other players followed by Epic name (profile menu > + Track a player)
     },
-    # New MMR: read from Rocket League's own log each time you queue ranked (rlutils/rllog.py). `dir` = ""
-    # is Documents\My Games\Rocket League\TAGame\Logs.
-    "rl_log": {
-        "enabled": True,
-        "dir": "",
-        "every_s": 5,
-    },
     # Live MMR from Rocket League's servers (rlutils/psynet.py) for the Epic accounts signed in (epic_login.dat
-    # in the data folder, encrypted for this Windows user). `asked`: accounts / "start" already offered sign-in.
+    # in the data folder, encrypted for this Windows user). `asked`: switcher accounts already offered sign-in.
     "psynet": {
         "every_min": 30,
         "asked": [],
@@ -129,7 +123,7 @@ DEFAULTS = {
 }
 
 OBSOLETE_KEYS = ("phone", "ballchasing", "mmr_api_base", "mmr_poll", "screen_read", "statsapi_host",
-                 "statsapi_port", "update_feed_url", "http_timeout_s", "shift")
+                 "statsapi_port", "update_feed_url", "http_timeout_s", "shift", "rl_log")
 # Settings of removed features, dropped from a saved config.json when it loads.
 OBSOLETE_SUBKEYS = {
     "overlay": ("show_session", "show_streak", "show_mmr", "show_status", "show_rank",
@@ -242,7 +236,7 @@ SOURCE_CURRENT = "kmdw_current"           # reading from the current-MMR API
 SOURCE_MANUAL = "manual"                  # MMR the user typed in (e.g. from the in-game display)
 SOURCE_SCREEN = "screen"                  # MMR read from the in-game display by OCR (old data only)
 SOURCE_SHIFT = "shift"                    # MMR shown by Shift (its tracker.ini or its Tracker > Match card)
-SOURCE_RL_LOG = "rl_log"                  # MMR from Rocket League's Launch.log when you queue (rllog.py)
+SOURCE_RL_LOG = "rl_log"                  # MMR from Rocket League's Launch.log (old data only)
 SOURCE_PSYNET = "psynet"                  # MMR read live from Rocket League's servers after an Epic sign-in (psynet.py)
 USER_SOURCES = (SOURCE_MANUAL, SOURCE_SCREEN, SOURCE_SHIFT)  # readings that settle matches waiting for MMR
 
@@ -918,6 +912,12 @@ def list_profiles(path: Path | None = None) -> list[dict]:
     with closing(connect(path)) as conn:
         rows = conn.execute("SELECT key, player_id FROM profiles ORDER BY key").fetchall()
         return [dict(r) for r in rows]
+
+
+def account_hex(player_id: str | None) -> str | None:
+    """'Epic|<32 hex>|0' -> the 32-hex account id, lower case; None for other platforms or nothing."""
+    m = re.fullmatch(r"Epic\|([0-9a-fA-F]{32})\|\d+", (player_id or "").strip())
+    return m.group(1).lower() if m else None
 
 
 def profile_for_epic_account(account_id: str, name: str, path: Path | None = None) -> str:

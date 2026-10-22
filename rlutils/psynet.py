@@ -1,13 +1,15 @@
 """Live ranked MMR straight from Rocket League's servers (PsyNet), the way https://github.com/dank/rlapi does it.
 
-Sign-in happens once, on Epic's own login page (shown in a window of the app, see EpicLoginDialog in app.py):
-the page hands back a one-time authorization code, which is traded here for an Epic launcher refresh token.
-Only that refresh token is kept, encrypted with Windows DPAPI (only this Windows user on this PC can decrypt
-it) in the data folder's epic_login.dat. The password is typed into Epic's page and never reaches the app.
+Sign-in happens once, in the user's own browser (Epic's device sign-in, epicgames.com/activate): the app shows
+a code, the user signs in on Epic's site and approves it, and the app, polling, gets an Epic token. That token
+creates an Epic "device auth" (account id, device id, secret) for this PC, a permanent login that lasts until
+the user changes their password or removes it on epicgames.com. Only the device auth is kept, encrypted with
+Windows DPAPI (only this Windows user on this PC can decrypt it) in the data folder's epic_login.dat. The
+password is typed into Epic's site and never reaches the app.
 
 Each fetch:
-    refresh token -> Epic launcher token (and a new refresh token, saved)  account-public-service-prod03.ol.epicgames.com
-    launcher token -> exchange code -> EOS token for Rocket League           api.epicgames.dev
+    device auth -> Epic token                                              account-public-service-prod03.ol.epicgames.com
+    Epic token -> exchange code -> EOS token for Rocket League             api.epicgames.dev
     EOS token -> Auth/AuthPlayer/v2 -> PsyToken + WebSocket URL              api.rlpp.psynet.gg
     WebSocket: Skills/GetPlayerSkill v1 for the player's own id, then close  ws.rlpp.psynet.gg
 
@@ -37,7 +39,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 EGS_UA = "UELauncher/11.0.1-14907503+++Portal+Release-Live Windows/10.0.19041.1.256.64bit"
-EGS_CLIENT = ("34a02cf8f4414e29b15921876da36f9a", "daafbccc737745039dffe53d94fc76cf")  # Epic launcher (public)
+EGS_CLIENT = ("34a02cf8f4414e29b15921876da36f9a", "daafbccc737745039dffe53d94fc76cf")  # Epic launcher
+DEVICE_CODE_CLIENT = ("98f7e42c2e3a4f86a74eb43fbb41ed39", "0a2449a2-001a-451e-afec-3e812901c4d7")  # allows device codes
+DEVICE_AUTH_CLIENT = ("3f69e56c7649492c8cc29f1af08a8a12", "b51ee9cb12234f50a69efa67ef53812e")  # allows device auths
 EGS_HOST = "https://account-public-service-prod03.ol.epicgames.com"
 EOS_CLIENT = ("xyza7891p5D7s9R6Gm6moTHWGloerp7B", "Knh18du4NVlFs+3uQ+ZPpDCVto0WYf4yXP8+OcwVt1o")  # Rocket League
 EOS_DEPLOYMENT = "da32ae9c12ae40e8a112c52e1f17f3ba"
@@ -52,16 +56,11 @@ DEFAULT_VERSION = {
     "buildSecret": "76656a5b51ec57a13549eef732c8a8367638aa3a7989bade1f7e4e5f93d57625",
 }
 
-REDIRECT_PREFIX = "https://www.epicgames.com/id/api/redirect"
-LOGIN_URL = ("https://www.epicgames.com/id/login?redirectUrl="
-             + urllib.parse.quote(f"{REDIRECT_PREFIX}?clientId={EGS_CLIENT[0]}&responseType=code", safe=""))
-LOGOUT_URL = "https://www.epicgames.com/id/logout?redirectUrl=" + urllib.parse.quote(LOGIN_URL, safe="")
-
 TIMEOUT = 20
 
 
 class LoginExpired(Exception):
-    """The saved sign-in no longer works (unused for weeks, password changed, or signed out): sign in again."""
+    """The saved sign-in no longer works (password changed, or removed on epicgames.com): sign in again."""
 
 
 class PsyNetError(Exception):
@@ -98,7 +97,8 @@ def _dpapi(data: bytes, encrypt: bool) -> bytes:
 
 
 class LoginStore:
-    """{account id (32 hex): {"name", "refresh", "refresh_expires"}} in one encrypted file."""
+    """{account id (32 hex): {"name", "device_id", "secret"}} in one encrypted file. Sign-ins from 0.11.1 hold
+    {"name", "refresh"} instead and are turned into a device auth on their next use."""
 
     def __init__(self, path: Path):
         self.path = Path(path)
@@ -120,10 +120,10 @@ class LoginStore:
         tmp.write_bytes(blob)
         tmp.replace(self.path)
 
-    def put(self, account: str, name: str, refresh: str, refresh_expires: str = "") -> None:
+    def put(self, account: str, name: str, **creds: str) -> None:
         with self.lock:
             accounts = self.load()
-            accounts[account.lower()] = {"name": name, "refresh": refresh, "refresh_expires": refresh_expires}
+            accounts[account.lower()] = {"name": name, **creds}
             self._write(accounts)
 
     def remove(self, account: str) -> None:
@@ -166,22 +166,105 @@ def _form(url: str, client: tuple[str, str], fields: dict) -> dict:
     except ValueError:
         js = {}
     if status != 200:
-        msg = js.get("errorMessage") or js.get("errorCode") or body[:200].decode("utf-8", "replace")
-        err = LoginExpired if (status in (400, 401) and fields.get("grant_type") == "refresh_token") else PsyNetError
-        raise err(f"Epic said {status}: {msg}")
+        code = js.get("errorCode") or ""
+        if code.endswith("authorization_pending") or code.endswith("slow_down"):
+            raise Pending(code)
+        msg = js.get("errorMessage") or code or body[:200].decode("utf-8", "replace")
+        saved_login = fields.get("grant_type") in ("refresh_token", "device_auth")
+        raise (LoginExpired if saved_login and status in (400, 401) else PsyNetError)(f"Epic said {status}: {msg}")
     return js
 
 
-def login_with_code(code: str) -> dict:
-    """Authorization code from Epic's redirect page -> launcher token (access_token, refresh_token, account_id,
-    displayName, refresh_expires_at)."""
-    return _form(f"{EGS_HOST}/account/api/oauth/token", EGS_CLIENT,
-                 {"grant_type": "authorization_code", "code": code.strip(), "token_type": "eg1"})
+class Pending(Exception):
+    """The user hasn't approved the device sign-in in their browser yet."""
 
 
-def refresh(refresh_token: str) -> dict:
-    return _form(f"{EGS_HOST}/account/api/oauth/token", EGS_CLIENT,
-                 {"grant_type": "refresh_token", "refresh_token": refresh_token, "token_type": "eg1"})
+def _token(client: tuple[str, str], fields: dict) -> dict:
+    return _form(f"{EGS_HOST}/account/api/oauth/token", client, {**fields, "token_type": "eg1"})
+
+
+@dataclass
+class DeviceLogin:
+    user_code: str
+    device_code: str
+    url: str            # epicgames.com/activate with the code filled in: opened in the user's browser
+    interval: int
+    expires_at: float   # time.monotonic()
+
+
+def start_device_login() -> DeviceLogin:
+    """Ask Epic for a sign-in code the user approves in their browser."""
+    client = _token(DEVICE_CODE_CLIENT, {"grant_type": "client_credentials"})
+    status, body = _request(f"{EGS_HOST}/account/api/oauth/deviceAuthorization", data=b"prompt=login", headers={
+        "Content-Type": "application/x-www-form-urlencoded", "User-Agent": EGS_UA,
+        "Authorization": "bearer " + client["access_token"]})
+    if status != 200:
+        raise PsyNetError(f"Epic sign-in couldn't start: {status}")
+    js = json.loads(body)
+    return DeviceLogin(js["user_code"], js["device_code"],
+                       js.get("verification_uri_complete") or js["verification_uri"],
+                       max(2, int(js.get("interval") or 10)), time.monotonic() + int(js.get("expires_in") or 600))
+
+
+def poll_device_login(login: DeviceLogin) -> tuple[str, str, dict] | None:
+    """None while the user hasn't approved it yet; once they have: (account id, Epic name, credentials to save).
+    The credentials are a device auth made for this PC."""
+    try:
+        tok = _token(DEVICE_CODE_CLIENT, {"grant_type": "device_code", "device_code": login.device_code})
+    except Pending:
+        return None
+    try:
+        return _make_device_auth(tok)
+    except (PsyNetError, KeyError, ValueError):  # Epic refused a device auth: keep its refresh token instead
+        return tok["account_id"].lower(), tok.get("displayName", ""), {"refresh": tok["refresh_token"],
+                                                                         "client": "device_code"}
+
+
+def _make_device_auth(tok: dict) -> tuple[str, str, dict]:
+    """Any Epic token -> a device auth on the client that may use one (via an exchange code)."""
+    dev_tok = _token(DEVICE_AUTH_CLIENT, {"grant_type": "exchange_code", "exchange_code": _exchange_code(tok["access_token"])})
+    account = dev_tok["account_id"]
+    status, body = _request(f"{EGS_HOST}/account/api/public/account/{account}/deviceAuth", data=b"{}", headers={
+        "Content-Type": "application/json", "User-Agent": EGS_UA, "Authorization": "bearer " + dev_tok["access_token"]})
+    if status != 200:
+        raise PsyNetError(f"Epic couldn't save the sign-in for this PC: {status}")
+    js = json.loads(body)
+    name = dev_tok.get("displayName") or tok.get("displayName") or ""
+    return account.lower(), name, {"device_id": js["deviceId"], "secret": js["secret"]}
+
+
+def _signed_in_token(store: LoginStore, account: str) -> dict:
+    """An Epic token for a saved account. A 0.11.1 sign-in (refresh token) becomes a device auth here."""
+    saved = store.load().get(account.lower())
+    if not saved:
+        raise LoginExpired("not signed in")
+    if saved.get("secret"):
+        return _token(DEVICE_AUTH_CLIENT, {"grant_type": "device_auth", "account_id": account,
+                                           "device_id": saved["device_id"], "secret": saved["secret"]})
+    client = DEVICE_CODE_CLIENT if saved.get("client") == "device_code" else EGS_CLIENT
+    tok = _token(client, {"grant_type": "refresh_token", "refresh_token": saved["refresh"]})
+    try:
+        acc, name, creds = _make_device_auth(tok)
+    except (PsyNetError, KeyError, ValueError):
+        acc, name = tok["account_id"].lower(), tok.get("displayName", "")
+        creds = {"refresh": tok["refresh_token"], **({"client": saved["client"]} if saved.get("client") else {})}
+    store.put(acc, name or saved.get("name", ""), **creds)
+    return tok
+
+
+def sign_out(store: LoginStore, account: str) -> None:
+    """Delete the saved sign-in here and, best effort, the device auth on Epic's side too."""
+    saved = store.load().get(account.lower()) or {}
+    store.remove(account)
+    if not saved.get("secret"):
+        return
+    try:
+        tok = _token(DEVICE_AUTH_CLIENT, {"grant_type": "device_auth", "account_id": account,
+                                          "device_id": saved["device_id"], "secret": saved["secret"]})
+        _request(f"{EGS_HOST}/account/api/public/account/{account}/deviceAuth/{saved['device_id']}", method="DELETE",
+                 headers={"User-Agent": EGS_UA, "Authorization": "bearer " + tok["access_token"]})
+    except Exception:
+        pass  # offline: the local copy is gone either way; it can also be removed on epicgames.com
 
 
 def _exchange_code(access_token: str) -> str:
@@ -198,10 +281,6 @@ def _eos_token(exchange_code: str) -> dict:
                   "deployment_id": EOS_DEPLOYMENT, "scope": "basic_profile"})
 
 
-def code_from_redirect_text(text: str) -> str | None:
-    """The authorizationCode in Epic's redirect page ({"redirectUrl": ..., "authorizationCode": "..."})."""
-    m = re.search(r'"authorizationCode"\s*:\s*"([0-9a-fA-F]{32})"', text or "")
-    return m.group(1) if m else None
 
 
 # ====================================================================================================
@@ -336,14 +415,10 @@ class Fetch:
 
 
 def fetch_skills(store: LoginStore, account: str, version: Version) -> Fetch:
-    """Sign in with the saved refresh token (saving the new one Epic gives back), then read the player's
-    skills from PsyNet. LoginExpired when the saved sign-in no longer works."""
-    saved = store.load().get(account.lower())
-    if not saved:
-        raise LoginExpired("not signed in")
-    tok = refresh(saved["refresh"])
-    name = tok.get("displayName") or saved.get("name", "")
-    store.put(tok["account_id"], name, tok["refresh_token"], tok.get("refresh_expires_at", ""))
+    """Sign in with the saved device auth, then read the player's skills from PsyNet. LoginExpired when the
+    saved sign-in no longer works."""
+    tok = _signed_in_token(store, account)
+    name = tok.get("displayName") or store.load().get(account.lower(), {}).get("name", "")
     eos = _eos_token(_exchange_code(tok["access_token"]))
     try:
         auth = _auth_player(eos, name, version.v)

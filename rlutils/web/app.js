@@ -47,7 +47,7 @@ function render() {
   paint("main", ({ MMR: mmrPage, Games: gamesPage, Play: playPage, Settings: settingsPage })[U.screen]());
   paint("footer", footer());
   importer();
-  paint("setup", setupPanel());
+  paint("setup", setupPanel() + signinPanel());
   paint("overlay", overlay());
   if (U.screen === "MMR") drawTip();
 }
@@ -90,13 +90,13 @@ function playlistSeg() {
 }
 
 function header() {
-  const t = S.top, k = S.log;
+  const t = S.top, k = S.live;
   return `<div class="who"><div class="gem" style="border-color:${t.gem};"></div><div style="min-width:0;"><div class="name">${esc(S.profile ? S.profile.name : "No profile yet")}</div><div class="rank" style="color:${t.rankColor}">${esc(t.rank)}</div></div></div>
     <div class="vr"></div>
     <div class="bigmmr"><span class="v">${esc(t.mmr)}</span><span class="u">MMR</span><span class="t" style="color:${t.todayColor}">${esc(t.today)}</span></div>
     <div class="flex1"></div>
     ${playlistSeg()}
-    <div class="pill" ${act("go", "Play")} title="${esc(k.live.on ? k.live.detail : k.full)}"><div class="dot" style="background:${k.live.on ? k.live.color : k.color}"></div><span style="font-weight:600;">${k.live.on ? "Live MMR" : "MMR log"}</span><span style="color:#a8a8a8;">${esc(k.live.on ? k.live.short : k.short)}</span></div>`;
+    <div class="pill" ${act("go", "Play")} title="${esc(k.detail)}"><div class="dot" style="background:${k.color}"></div><span style="font-weight:600;">Live MMR</span><span style="color:#a8a8a8;">${esc(k.short)}</span></div>`;
 }
 
 // --- MMR ---------------------------------------------------------------------------------------------
@@ -266,7 +266,7 @@ function gamesPage() {
 // --- Play --------------------------------------------------------------------------------------------
 
 function playPage() {
-  const P = S.play, k = S.log;
+  const P = S.play, k = S.live;
   let h = `<div style="display:grid;grid-template-columns:minmax(0,1.15fr) minmax(0,1fr);gap:16px;align-items:start;">
     <div class="col">
       <div class="card" style="padding:24px;display:flex;flex-direction:column;gap:18px;">
@@ -296,13 +296,10 @@ function playPage() {
         <div class="lbl">MMR</div>
         <div style="display:flex;align-items:center;gap:10px;"><div style="width:8px;height:8px;border-radius:50%;background:${k.color};flex:none;"></div><div style="font-size:14px;font-weight:600;">${esc(k.title)}</div></div>
         <div style="font-size:13px;color:#a8a8a8;margin-top:-6px;user-select:text;">${esc(k.detail)}</div>
+        <div style="font-size:13px;color:#d6d6d6;user-select:text;">${esc(k.last)}</div>
         <div style="font-size:11px;color:#7d7d7d;line-height:1.5;">${esc(k.note)}</div>
-        <div style="border-top:1px solid #2d2d2d;padding-top:12px;display:flex;flex-direction:column;gap:8px;">
-          <div style="display:flex;align-items:center;gap:10px;"><div style="width:8px;height:8px;border-radius:50%;background:${k.live.color};flex:none;"></div><div style="font-size:14px;font-weight:600;">${esc(k.live.title)}</div></div>
-          <div style="font-size:13px;color:#a8a8a8;user-select:text;">${esc(k.live.detail)}</div>
-        </div>
         <div style="display:flex;gap:8px;flex-wrap:wrap;">
-          ${k.live.on ? `<div class="btn${k.live.busy ? " dis" : ""}" ${act("liveRefresh")} title="Read your MMR from Rocket League's servers now">Refresh now</div>` : `<div class="btn primary" ${act("epicLogin")}>Sign in for live MMR</div>`}
+          ${k.on ? `<div class="btn${k.busy ? " dis" : ""}" ${act("liveRefresh")} title="Read your MMR from Rocket League's servers now">Refresh now</div>` : `<div class="btn primary" ${act("epicLogin")}>Sign in with Epic</div>`}
           <div class="btn" ${act("importOpen")} title="One-time import of your past MMR from tracker.gg, for the account picked on the left">Import history</div>
         </div>
       </div>
@@ -344,11 +341,11 @@ function settingsPage() {
       <div style="font-size:13px;">${esc(R.launch)}</div>
       <div class="row" style="gap:8px;flex-wrap:wrap;"><div class="btn" ${act("findGame")}>Find automatically</div><div class="btn" ${act("chooseGame")}>Choose the game or a shortcut…</div></div>
       <div style="display:flex;align-items:center;gap:8px;font-size:13px;"><div class="dot" style="background:${R.apiColor}"></div><span style="font-weight:600;">Stats API</span><span style="color:#a8a8a8;" title="${esc(R.apiPath)}">${esc(R.api)}</span></div>
-      <div class="row" style="gap:8px;flex-wrap:wrap;">${R.apiOn ? "" : `<div class="btn${R.gameRunning ? " dis" : ""}" ${act("enableStats")} title="${R.gameRunning ? "Close Rocket League first" : "Sets PacketSendRate=10 in TAStatsAPI.ini"}">Enable Stats API</div>`}<div class="btn" ${act("setupOpen", "profile")}>Run setup again</div></div>
+      <div class="row" style="gap:8px;flex-wrap:wrap;">${R.apiOn ? "" : `<div class="btn${R.gameRunning ? " dis" : ""}" ${act("enableStats")} title="${R.gameRunning ? "Close Rocket League first" : "Sets PacketSendRate=10 in TAStatsAPI.ini"}">Enable Stats API</div>`}<div class="btn" ${act("setupOpen", "game")}>Run setup again</div></div>
     </div>
     <div class="card" style="padding:16px;display:flex;flex-direction:column;gap:12px;">
-      <div class="lbl">Live MMR (Epic sign-in)</div>
-      <div style="font-size:13px;color:#a8a8a8;">${esc(S.log.live.detail)}</div>`;
+      <div class="lbl">Epic sign-in (MMR tracking)</div>
+      <div style="font-size:13px;color:#a8a8a8;">${esc(S.live.detail)}</div>`;
   for (const a of T.epic) h += `<div style="display:flex;align-items:center;gap:12px;font-size:13px;"><div style="flex:1;"><b>${esc(a.name)}</b> <span style="color:#7d7d7d;">${esc(a.id)}</span></div><div class="btn" ${act("epicLogout", a.id)}>Sign out</div></div>`;
   h += `<div class="row" style="gap:8px;flex-wrap:wrap;"><div class="btn${T.epic.length ? "" : " primary"}" ${act("epicLogin")}>${T.epic.length ? "Sign in another account" : "Sign in with Epic"}</div></div>
       <div style="font-size:11px;color:#7d7d7d;line-height:1.5;">${esc(T.privacy)}</div>
@@ -363,7 +360,7 @@ function settingsPage() {
       <div class="btn" ${act("export")} title="Export the MMR history as CSV or JSON">Export</div>
       <div class="btn" ${act("openFolder")}>Open folder</div>
     </div>
-    <div style="font-size:11px;color:#7d7d7d;line-height:1.5;">${esc(S.app.title)} ${esc(S.app.version)} · Not affiliated with Psyonix, Epic Games or Tracker Network. Rocket League is a trademark of Psyonix LLC. Reads the game's own log files and its local Stats API, and (once you sign in) your MMR from Rocket League's servers through the same unofficial API the game uses (github.com/dank/rlapi). The game itself is never touched.</div>
+    <div style="font-size:11px;color:#7d7d7d;line-height:1.5;">${esc(S.app.title)} ${esc(S.app.version)} · Not affiliated with Psyonix, Epic Games or Tracker Network. Rocket League is a trademark of Psyonix LLC. Reads your MMR from Rocket League's servers (after your Epic sign-in) through the same unofficial API the game uses (github.com/dank/rlapi), and games from the game's local Stats API. The game itself is never touched.</div>
   </div>`;
   return h;
 }
@@ -437,38 +434,25 @@ function importButtons(I) {
 }
 
 // --- Setup (first start; Settings > Run setup again) -------------------------------------------------
-// Steps: your Epic name, how Play starts the game, Rocket League's Stats API. The typed name is kept in
-// U.setupName so a state update while typing doesn't lose it.
+// Steps: the Epic sign-in (required: MMR comes from it), how Play starts the game, Rocket League's Stats API.
 
 function setupPanel() {
   const T = S.setup;
-  if (!T) { U.setupName = undefined; return ""; }
-  if (U.setupSeq !== T.seq) { U.setupSeq = T.seq; U.setupName = undefined; }
+  if (!T) return "";
   const idx = T.steps.indexOf(T.step);
   let h = `<div class="wizbg"><div class="pop wiz" data-stop="1" style="width:640px;">
     <div class="tabs">${T.steps.map((s, i) => `<div class="${i <= idx || T.step === "done" ? "on" : ""}"></div>`).join("")}</div>`;
   const err = T.error ? `<div class="note err">${esc(T.error)}</div>` : "";
-  if (T.step === "profile") {
-    const name = U.setupName !== undefined ? U.setupName : T.name;
-    h += `<div class="mt">Welcome to ${esc(S.app.title)}</div>
-      <div class="lead">Four quick things and you're set. Everything here can be changed later in Settings.</div>
-      <div class="lbl">Your Epic name</div>
-      <input class="field" id="setupname" value="${esc(name)}" placeholder="The name other players see in Rocket League" spellcheck="false" maxlength="64">
-      ${T.detected.length ? `<div class="sub">Found on this PC:</div><div class="chips">${T.detected.map(n => `<div class="chip" ${act("setupChip", n)}>${esc(n)}</div>`).join("")}</div>` : ""}
-      <div class="sub" style="line-height:1.5;">Your MMR and games are saved under this name.</div>
-      <div class="sub" style="line-height:1.5;"><b>Several Epic accounts?</b> The Play page can switch between them for you (optional). It saves the Epic launcher's "Remember me" sign-in for each account you add, encrypted so only your Windows user on this PC can read it, and swaps it in before starting the game. Nothing is sent anywhere, and your password is never seen.</div>
-      ${err}
-      <div class="ibtns"><div class="btn" ${act("setupFinish")}>Skip setup</div><div class="btn primary" ${act("setupName")}>Next</div></div>`;
-  } else if (T.step === "epic") {
-    h += `<div class="mt">Sign in to Epic for live MMR</div>
-      <div class="lead">With one sign-in, ${esc(S.app.title)} reads your current MMR for every ranked playlist straight from Rocket League's servers, even before you queue. You only do this once.</div>
+  if (T.step === "epic") {
+    h += `<div class="mt">${T.required ? "Welcome to " + esc(S.app.title) : "Sign in to Epic"}</div>
+      <div class="lead">${esc(S.app.title)} tracks your MMR for every ranked playlist straight from Rocket League's servers. For that it needs you to sign in to Epic once: your browser opens Epic's sign-in page, and you won't be asked again.</div>
       <div class="note info" style="line-height:1.5;">${esc(T.privacy)}</div>`;
     if (T.epic.length) h += `<div class="steps">${T.epic.map(a => `<div class="step"><div class="num ok">✓</div><div>Signed in as <b>${esc(a.name)}</b></div></div>`).join("")}</div>`;
-    h += `<div class="sub" style="line-height:1.5;">Uses the same unofficial API as Rocket League itself (github.com/dank/rlapi); not made or endorsed by Psyonix or Epic. It's never used while Rocket League runs: then your MMR comes from the game's log.</div>
+    h += `<div class="sub" style="line-height:1.5;">Uses the same unofficial API as Rocket League itself (github.com/dank/rlapi); not made or endorsed by Psyonix or Epic. It isn't used while Rocket League runs, so a session's MMR shows when you close the game.</div>
       ${err}
-      <div class="ibtns"><div class="btn" ${act("setupGo", "profile")}>Back</div>` + (T.epic.length
+      <div class="ibtns">` + (T.epic.length
         ? `<div class="btn" ${act("epicLogin")}>Add another account</div><div class="btn primary" ${act("setupGo", "game")}>Next</div>`
-        : `<div class="btn" ${act("setupGo", "game")}>Not now</div><div class="btn primary" ${act("epicLogin")}>Sign in with Epic</div>`) + `</div>`;
+        : `<div class="btn primary" ${act("epicLogin")}>Sign in with Epic</div>`) + `</div>`;
   } else if (T.step === "game") {
     h += `<div class="mt">How should Play start Rocket League?</div>
       <div class="lead">Right now: through <b>${esc(T.launch)}</b>.</div>
@@ -497,14 +481,29 @@ function setupPanel() {
   } else {
     h += `<div class="mt">You're set</div>
       <div class="steps">
-        <div class="step"><div class="num ok">✓</div><div>Profile: <b>${esc(T.profile || T.name)}</b></div></div>
-        <div class="step"><div class="num${T.epic.length ? " ok" : ""}">${T.epic.length ? "✓" : "!"}</div><div>Live MMR: ${T.epic.length ? "signed in as <b>" + T.epic.map(a => esc(a.name)).join(", ") + "</b>" : "not signed in. Sign in any time on the Play page or in Settings"}</div></div>
+        <div class="step"><div class="num ok">✓</div><div>Signed in to Epic as <b>${T.epic.map(a => esc(a.name)).join(", ")}</b></div></div>
         <div class="step"><div class="num ok">✓</div><div>Play starts Rocket League through <b>${esc(T.launch)}</b></div></div>
         <div class="step"><div class="num${T.apiOn ? " ok" : ""}">${T.apiOn ? "✓" : "!"}</div><div>Stats API: ${T.apiOn ? "on" : "off. Turn it on any time in Settings > Rocket League"}</div></div>
-        <div class="step"><div class="num" style="background:#373737;color:#a8a8a8;">i</div><div class="dim">Your MMR is read live from Rocket League's servers (when signed in) and from the game's log each time you queue ranked. Past MMR can be imported once from tracker.gg: Play page > Import history.</div></div>
+        <div class="step"><div class="num" style="background:#373737;color:#a8a8a8;">i</div><div class="dim">Your MMR comes from Rocket League's servers: when the app starts, when you close the game and every 30 minutes. Past MMR can be imported once from tracker.gg: Play page > Import history.</div></div>
       </div>
       <div class="ibtns"><div class="btn primary" ${act("setupFinish")}>Finish</div></div>`;
   }
+  return h + `</div></div>`;
+}
+
+function signinPanel() {
+  const G = S.signin;
+  if (!G) return "";
+  let h = `<div class="wizbg" style="z-index:60;"><div class="pop wiz" data-stop="1" style="width:520px;">
+    <div class="mt">Sign in to Epic in your browser</div>`;
+  if (G.state === "starting") h += `<div class="lead">Opening Epic's sign-in page…</div>`;
+  else if (G.state === "error") h += `<div class="note err">${esc(G.error)}</div>`;
+  else h += `<div class="lead">Your browser opened Epic's sign-in page. Sign in there (with your password, 2FA or a security check if Epic asks), then confirm this code:</div>
+      <div style="font:700 30px var(--ft);letter-spacing:6px;text-align:center;padding:10px 0;user-select:text;">${esc(G.code)}</div>
+      <div class="sub" style="line-height:1.5;">This window closes by itself once you've approved it. Browser didn't open? Click <b>Open the page again</b>.</div>`;
+  h += `<div class="ibtns"><div class="btn" ${act("epicCancel")}>Cancel</div>` + (G.state === "error"
+    ? `<div class="btn primary" ${act("epicLogin")}>Try again</div>`
+    : `<div class="btn primary${G.state === "starting" ? " dis" : ""}" ${act("epicOpen")}>Open the page again</div>`) + `</div>`;
   return h + `</div></div>`;
 }
 
@@ -562,8 +561,6 @@ const LOCAL = {
   tray: v => { U.trayOpen = false; if (v === "vibrance") { U.screen = "Play"; call("screen", "Play"); } else call("tray", v); },
   deleteGame: v => { U.ctx = null; call("deleteGame", v); },
   impCheck: () => { const box = document.getElementById("imptext"); call("importCheck", { text: box ? box.value : "" }); },
-  setupChip: v => { U.setupName = v; const f = document.getElementById("setupname"); if (f) f.value = v; },
-  setupName: () => { const f = document.getElementById("setupname"); call("setupProfile", { name: f ? f.value : (U.setupName || "") }); },
   modal: i => {
     const m = U.modal, f = document.getElementById("modalfield");
     U.modal = null;
@@ -624,7 +621,6 @@ document.addEventListener("mouseleave", () => { if (U.hover != null) { U.hover =
 
 document.addEventListener("input", e => {
   if (e.target.id === "vib") document.getElementById("vibval").textContent = e.target.value + "%";
-  if (e.target.id === "setupname") U.setupName = e.target.value;
 });
 document.addEventListener("change", e => {
   if (e.target.id === "vib") call("setVibrance", +e.target.value);
@@ -635,11 +631,11 @@ document.addEventListener("keydown", e => {
   if (e.key === "Escape") {
     if (U.modal) { U.modal = null; render(); return; }
     if (closePopups()) { render(); return; }
-    if (S && S.imp) call("importCancel");
-    else if (S && S.setup) call("setupFinish");
+    if (S && S.signin) call("epicCancel");
+    else if (S && S.imp) call("importCancel");
+    else if (S && S.setup && S.setup.epic.length) call("setupFinish");
     return;
   }
-  if (e.key === "Enter" && e.target.id === "setupname") { LOCAL.setupName(); return; }
   if (e.key === "Enter" && e.target.dataset && e.target.dataset.path) { e.target.blur(); return; }
   if (e.key === "Enter" && e.target.id === "modalfield" && U.modal) {
     const i = (U.modal.buttons || []).findIndex(b => b.primary);

@@ -6,8 +6,10 @@ TCP 127.0.0.1:49123 (Port). RLUtils only listens: it never sends a command, and 
 """
 from __future__ import annotations
 
+import ctypes
 import json
 import math
+import os
 import queue
 import re
 import socket
@@ -724,11 +726,45 @@ DEFAULT_RATE = 10
 DEFAULT_PORT = 49123
 
 
+def _known_documents() -> Path | None:
+    """Documents as Windows has it: follows a move, e.g. to OneDrive (folder redirection / Known Folder Move)."""
+    if os.name != "nt":
+        return None
+    try:
+        buf = ctypes.create_unicode_buffer(1024)
+        if ctypes.windll.shell32.SHGetFolderPathW(None, 5, None, 0, buf) == 0:  # CSIDL_PERSONAL = Documents
+            return Path(buf.value)
+    except (AttributeError, OSError):
+        pass
+    return None
+
+
+def documents_candidates(env: dict | None = None, known: Path | None = None) -> list[Path]:
+    """Where Documents can be, most likely first: Windows' own answer, then OneDrive's Documents (Known
+    Folder Move, also when Windows still answers the old place), then the profile's Documents."""
+    env = os.environ if env is None else env
+    out: list[Path] = []
+    for p in ([known] if known else []) + [Path(env[k]) / "Documents" for k in ("OneDrive", "OneDriveConsumer",
+                                                                              "OneDriveCommercial") if env.get(k)] \
+            + ([Path(env["USERPROFILE"]) / "Documents"] if env.get("USERPROFILE") else [Path.home() / "Documents"]):
+        if p not in out:
+            out.append(p)
+    return out
+
+
+def rocket_league_dir(candidates: list[Path] | None = None) -> Path:
+    """Documents\\My Games\\Rocket League: the first candidate where it exists, else under Windows' Documents."""
+    candidates = candidates if candidates is not None else documents_candidates(known=_known_documents())
+    for docs in candidates:
+        if (docs / "My Games" / "Rocket League").is_dir():
+            return docs / "My Games" / "Rocket League"
+    return candidates[0] / "My Games" / "Rocket League"
+
+
 def stats_ini_path(rl_dir: Path | None = None) -> Path:
     """The player's copy: Documents\\My Games\\Rocket League\\TAGame\\Config\\TAStatsAPI.ini. The game makes it
     from the install folder's file (below) and remakes it when that one changes (its [IniVersion] stamp)."""
-    from . import rllog
-    return Path(rl_dir or rllog.rocket_league_dir()) / "TAGame" / "Config" / "TAStatsAPI.ini"
+    return Path(rl_dir or rocket_league_dir()) / "TAGame" / "Config" / "TAStatsAPI.ini"
 
 
 def install_ini_path(install_dir: Path) -> Path:

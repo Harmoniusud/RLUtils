@@ -25,7 +25,7 @@ else { Write-Warning "No LICENSE.txt in the project yet: the zip has none for RL
 
 # Last check: nothing personal (data folder files, the saved-accounts store, keys, logs).
 $bad = Get-ChildItem $stage -Recurse -File | Where-Object {
-    $_.Name -match '^(tracker\.db|config\.json|rllog_state\.json|trackergg_session\.json|.*key.*\.txt|Launch.*\.log|state\.json)$' -or
+    $_.Name -match '^(tracker\.db|config\.json|rllog_state\.json|epic_login\.dat|psynet_version\.json|trackergg_session\.json|.*key.*\.txt|Launch.*\.log|state\.json)$' -or
     $_.FullName -match '\\(epic-accounts|edge-trackergg|accounts)\\' }
 if ($bad) { throw "Personal files in the release: $($bad.FullName -join ', ')" }
 
