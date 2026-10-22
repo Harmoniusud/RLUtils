@@ -968,6 +968,13 @@ def get_profile(key: str, path: Path | None = None) -> dict | None:
         return dict(row) if row else None
 
 
+def drop_raw_psynet_readings(path: Path | None = None) -> int:
+    """0.11.2 saved PsyNet's raw skill (e.g. 46) instead of the MMR the game shows (1013): those readings
+    can't be converted back exactly (they were rounded), so they're removed; the next check reads them again."""
+    with closing(connect(path)) as conn, conn:
+        return conn.execute("DELETE FROM mmr_snapshots WHERE source = ? AND rating < 100", (SOURCE_PSYNET,)).rowcount
+
+
 def insert_snapshots(profile_key: str, snapshots: list[Snapshot], path: Path | None = None) -> int:
     """Insert snapshots. Returns how many were new (duplicates are ignored)."""
     rows = [

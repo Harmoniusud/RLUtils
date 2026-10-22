@@ -513,7 +513,7 @@ function footer() {
   const st = S.status;
   let h = `<div style="display:flex;align-items:center;gap:6px;" title="${esc(S.api.full)}"><div style="width:6px;height:6px;border-radius:50%;background:${S.api.color};"></div>Stats API ${esc(S.api.label)}</div>
     <div>${esc(st.session)}</div><div class="msg" title="${esc(st.msg)}">${esc(st.msg)}</div><div class="flex1"></div>
-    ${S.update ? `<div style="display:flex;align-items:center;gap:6px;color:#e6ccff;"><span ${act("updateOpen")} style="cursor:pointer;font-weight:600;" title="Open the release page on GitHub to download it">RLUtils ${esc(S.update.version)} is out · Download</span><span ${act("updateSkip")} style="cursor:pointer;color:#7d7d7d;padding:0 2px;" title="Don't show this version again">✕</span></div>` : ""}
+    ${S.update ? `<div style="display:flex;align-items:center;gap:6px;color:${S.update.error ? "#ff99a4" : "#e6ccff"};"><span ${S.update.busy ? "" : act("updateOpen")} style="cursor:${S.update.busy ? "default" : "pointer"};font-weight:600;" title="${S.update.error ? "Click to try again" : "Update RLUtils"}">${esc(S.update.label)}</span>${S.update.busy ? "" : `<span ${act("updateSkip")} style="cursor:pointer;color:#7d7d7d;padding:0 2px;" title="Don't show this version again">✕</span>`}</div>` : ""}
     <div>v${esc(S.app.version)}</div>
     <div class="traybtn" ${act("toTray")} title="Hide to the tray (the app keeps running; click the tray icon to open it again)"><div style="width:8px;height:8px;background:#B65CF2;transform:rotate(45deg);"></div>Tray</div>`;
   if (U.trayOpen) {

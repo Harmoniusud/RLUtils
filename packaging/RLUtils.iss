@@ -55,6 +55,8 @@ Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; Tasks: desktopico
 
 [Run]
 Filename: "{app}\{#AppExe}"; Description: "Start {#AppName}"; Flags: nowait postinstall skipifsilent
+; an update from inside the app runs this silently with /restart=1: start the new version afterwards
+Filename: "{app}\{#AppExe}"; Flags: nowait; Check: RestartAfterUpdate
 
 [UninstallRun]
 Filename: "{app}\{#AppExe}"; Parameters: "--quit"; Flags: runhidden waituntilterminated; RunOnceId: "QuitApp"
@@ -76,6 +78,11 @@ begin
   Exe := ExpandConstant('{app}\{#AppExe}');
   if FileExists(Exe) then
     Exec(Exe, '--quit', '', SW_HIDE, ewWaitUntilTerminated, Code);
+end;
+
+function RestartAfterUpdate(): Boolean;
+begin
+  Result := ExpandConstant('{param:restart|0}') = '1';
 end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;

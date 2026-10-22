@@ -6,9 +6,13 @@ from __future__ import annotations
 
 import csv
 import getpass
+import hashlib
 import json
+import os
 import queue
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.request
@@ -98,9 +102,49 @@ def version_tuple(text: str) -> tuple[int, ...]:
     return tuple(int(p) for p in parts) if all(p.isdigit() for p in parts) and parts != [""] else ()
 
 
+def installed_copy() -> bool:
+    """Running from the installer's install (its uninstaller sits next to the exe): updates can install."""
+    return FROZEN and (Path(sys.executable).parent / "unins000.exe").exists()
+
+
+def installer_asset(release: dict) -> dict | None:
+    """The release's RLUtils-Setup-<v>.exe with the SHA-256 GitHub computed for it, or None."""
+    for a in release.get("assets") or []:
+        name, digest = str(a.get("name") or ""), str(a.get("digest") or "")
+        if name.lower().startswith("rlutils-setup-") and name.lower().endswith(".exe") and digest.startswith("sha256:"):
+            return {"name": name, "url": a.get("browser_download_url") or "", "size": int(a.get("size") or 0),
+                    "sha256": digest.split(":", 1)[1].lower()}
+    return None
+
+
+def download_verified(url: str, dest: Path, sha256: str, size: int, progress=None) -> Path:
+    """Download to `dest` and check its SHA-256; a file that doesn't match is deleted and refused."""
+    if not url.startswith("https://github.com/Harmoniusud/RLUtils/releases/download/"):
+        raise ValueError("unexpected download address")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    part = dest.with_suffix(".part")
+    h = hashlib.sha256()
+    req = urllib.request.Request(url, headers={"User-Agent": f"RLUtils/{VERSION}"})
+    with urllib.request.urlopen(req, timeout=60) as r, open(part, "wb") as f:
+        done = 0
+        while chunk := r.read(1 << 20):
+            f.write(chunk)
+            h.update(chunk)
+            done += len(chunk)
+            if progress and size:
+                progress(min(99, done * 100 // size))
+    if h.hexdigest() != sha256:
+        part.unlink(missing_ok=True)
+        raise ValueError("the download doesn't match the checksum GitHub published for it; nothing was installed")
+    part.replace(dest)
+    return dest
+
+
 class UpdateChecker(QObject):
-    """Asks GitHub for the newest RLUtils release when the app starts and once a day. Only reads the release's
-    version and page link; nothing is downloaded or installed, and nothing about this PC is sent."""
+    """Asks GitHub for the newest RLUtils release when the app starts and once a day. When the user clicks
+    Update (installed copies only), downloads that release's installer from GitHub, checks it against the
+    SHA-256 GitHub publishes for it, runs it silently and quits; the installer starts the new version.
+    Nothing about this PC is sent."""
 
     found = Signal()
 
@@ -108,9 +152,44 @@ class UpdateChecker(QObject):
         super().__init__(window)
         self.window = window
         self.bg = Background(self)
-        self.latest: dict | None = None   # {"version", "url"} of a release newer than this one
+        self.latest: dict | None = None   # {"version", "url", "asset"} of a release newer than this one
+        self.state = ("idle", "")         # idle, downloading (percent), installing, error (text)
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.check)
+
+    def install(self) -> None:
+        u = self.latest
+        if not u or self.state[0] in ("downloading", "installing"):
+            return
+        asset = u.get("asset")
+        if not (installed_copy() and asset):
+            QDesktopServices.openUrl(QUrl(u["url"]))  # a portable or source copy: the release page
+            return
+        dest = Path(tempfile.gettempdir()) / "RLUtils-update" / asset["name"]
+        self.state = ("downloading", "0")
+        self.found.emit()
+
+        def progress(pct: int) -> None:
+            self.state = ("downloading", str(pct))
+
+        def done(path, err) -> None:
+            if err:
+                self.state = ("error", f"Update failed: {err}")
+                self.found.emit()
+                return
+            self.state = ("installing", "")
+            self.found.emit()
+            # the installer starts once this app has fully exited (its files must not be in use), then starts
+            # the new version itself (/restart=1, see RLUtils.iss)
+            script = (f"Wait-Process -Id {os.getpid()} -Timeout 60 -ErrorAction SilentlyContinue; "
+                      "Start-Sleep -Milliseconds 500; "
+                      f"Start-Process -FilePath '{str(path).replace(chr(39), chr(39) * 2)}' -ArgumentList "
+                      "'/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/SP-','/restart=1'")
+            subprocess.Popen(["powershell", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command",
+                              script], close_fds=True, creationflags=game.CREATE_NO_WINDOW)
+            QTimer.singleShot(300, self.window.quit_app)
+
+        self.bg.run(lambda: download_verified(asset["url"], dest, asset["sha256"], asset["size"], progress), done)
 
     def start(self) -> None:
         self.timer.start(24 * 3600 * 1000)
@@ -134,7 +213,8 @@ class UpdateChecker(QObject):
         tag = str(release.get("tag_name") or "")
         if version_tuple(tag) > version_tuple(VERSION):
             self.latest = {"version": tag.lstrip("vV"),
-                           "url": release.get("html_url") or "https://github.com/Harmoniusud/RLUtils/releases"}
+                           "url": release.get("html_url") or "https://github.com/Harmoniusud/RLUtils/releases",
+                           "asset": installer_asset(release)}
             self.found.emit()
 
 
@@ -252,6 +332,8 @@ class PsyNetWatcher(QObject):
         return self.store.accounts()
 
     def start(self) -> None:
+        if data.drop_raw_psynet_readings():
+            self.window.refresh(push=False)
         self.timer.start(max(5, int(self.window.cfg["psynet"].get("every_min", 30))) * 60_000)
         QTimer.singleShot(3000, self.tick)
 
@@ -704,7 +786,8 @@ class MainWindow(QMainWindow):
             "epicLogin": lambda _v: self.open_epic_login(), "epicLogout": self._epic_logout,
             "epicOpen": lambda _v: self.signin.open_page(), "epicCancel": lambda _v: self.signin.cancel(),
             "liveRefresh": lambda _v: self.live.tick(),
-            "updateOpen": lambda _v: self.updates.latest and QDesktopServices.openUrl(QUrl(self.updates.latest["url"])),
+            "updateOpen": self._ask_update, "updateInstall": lambda _v: self.updates.install(),
+            "updatePage": lambda _v: self.updates.latest and QDesktopServices.openUrl(QUrl(self.updates.latest["url"])),
             "updateSkip": self._skip_update,
             "setVibrance": self._set_vibrance, "toggleObs": self._toggle_obs,
             "toggle": self._toggle_setting, "setPath": self._set_path, "browse": self._browse,
@@ -1388,7 +1471,7 @@ class MainWindow(QMainWindow):
                  "sub": "Launch minimized when you sign in"},
                 {"key": "check_updates", "label": "Check for updates",
                  "on": bool(self.cfg["app"].get("check_updates", True)),
-                 "sub": "Once a day, ask GitHub whether a newer RLUtils is out (nothing is installed by itself)"},
+                 "sub": "Once a day, ask GitHub whether a newer RLUtils is out (it installs only when you click Update)"},
             ],
             "paths": [
                 {"key": "switcher", "label": "Account switcher", "value": launch["switcher"],
@@ -1643,9 +1726,35 @@ class MainWindow(QMainWindow):
 
     def _update_view(self) -> dict | None:
         u = self.updates.latest
-        if not u or u["version"] == self.cfg["app"].get("skip_version"):
+        state, text = self.updates.state
+        if not u or (u["version"] == self.cfg["app"].get("skip_version") and state == "idle"):
             return None
-        return {"version": u["version"], "url": u["url"]}
+        label = {"downloading": f"Downloading RLUtils {u['version']}… {text}%",
+                 "installing": f"Installing RLUtils {u['version']}…", "error": text}.get(
+            state, f"RLUtils {u['version']} is out · " + ("Update" if self._can_self_update() else "Download"))
+        return {"version": u["version"], "label": label, "busy": state in ("downloading", "installing"),
+                "error": state == "error"}
+
+    def _can_self_update(self) -> bool:
+        u = self.updates.latest
+        return bool(u and u.get("asset") and installed_copy())
+
+    def _ask_update(self, _v=None) -> None:
+        u = self.updates.latest
+        if not u or self.updates.state[0] in ("downloading", "installing"):
+            return
+        if not self._can_self_update():
+            QDesktopServices.openUrl(QUrl(u["url"]))
+            return
+        mb = round(u["asset"]["size"] / 1e6)
+        warn = ("\n\nRocket League is running: the update won't touch it, but RLUtils stops tracking until it "
+                "restarts (a few seconds)." if self._rl_running else "")
+        self.modal(f"Update to RLUtils {u['version']}?",
+                   f"RLUtils downloads the installer from its GitHub release ({mb} MB), checks it against the "
+                   "checksum GitHub published for it, installs it and starts again. Your data and sign-in stay."
+                   + warn,
+                   [{"label": "Not now"}, {"label": "What's new", "a": "updatePage"},
+                    {"label": "Update", "a": "updateInstall", "primary": True}])
 
     def _set_path(self, v) -> None:
         if not isinstance(v, dict):

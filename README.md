@@ -14,8 +14,8 @@ A small Windows app for Rocket League players.
 
 Get `RLUtils-Setup-<version>.exe` (installer) or `RLUtils-<version>.zip` (portable) from
 [Releases](../../releases). Windows 10/11, 64-bit. On first start a short setup has you sign in to Epic in your
-browser, finds the game, and offers to switch on Rocket League's Stats API. The app tells you when a newer
-version is out (Settings > Check for updates); install it over the old one, your data stays.
+browser, finds the game, and offers to switch on Rocket League's Stats API. When a newer version is out,
+the app offers to update itself (Settings > Check for updates); your data and sign-in stay.
 
 ## What it reads and changes
 
@@ -35,8 +35,10 @@ version is out (Settings > Check for updates); install it over the old one, your
   Windows DPAPI for your Windows user, and swaps it in before starting the game. It never sees passwords.
 - **Import history** (optional, once): you open tracker.gg pages in your own browser and paste them in. The app
   itself never contacts tracker.gg.
-- **Update check**: once a day the app asks GitHub for the newest release's version and shows a link if it's
-  newer. Nothing is downloaded or installed by the app.
+- **Updates**: once a day the app asks GitHub for the newest release. If it's newer, the status bar offers
+  it; when you click **Update**, the app downloads that release's installer from GitHub, checks it against the
+  SHA-256 GitHub publishes for it (a file that doesn't match is deleted), installs it silently and restarts.
+  Nothing happens without your click. A portable (zip) copy opens the release page instead.
 - The game process is never touched (no injection, no memory reading), so Easy Anti-Cheat isn't involved.
   Your data stays in `%LOCALAPPDATA%\RLUtils`; RLUtils has no server of its own.
 

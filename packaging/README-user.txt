@@ -19,8 +19,9 @@ What it reads and changes
   - Changes TAStatsAPI.ini only when you click "Enable Stats API" (a backup is kept).
   - The optional account switcher swaps the Epic launcher's saved login between accounts you saved. Saved
     logins are encrypted with Windows (DPAPI) so only your Windows user on this PC can read them.
-  - Once a day it asks GitHub whether a newer RLUtils is out (Settings > Check for updates). It only shows a
-    link; it never downloads or installs anything by itself.
+  - Once a day it asks GitHub whether a newer RLUtils is out (Settings > Check for updates). Click Update in
+    the status bar and it downloads the new installer from GitHub, checks its checksum, installs it and
+    restarts. Nothing is installed without your click.
   - The game itself is never touched, so Easy Anti-Cheat isn't affected.
   - Your data stays on this PC (in %LOCALAPPDATA%\RLUtils). RLUtils has no server of its own.
 

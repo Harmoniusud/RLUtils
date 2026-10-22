@@ -27,6 +27,7 @@ import ctypes
 import hashlib
 import hmac
 import json
+import math
 import re
 import threading
 import time
@@ -395,11 +396,16 @@ class Skill:
     matches: int
 
 
+def skill_to_mmr(skill: float) -> int:
+    """PsyNet's "MMR" is the raw skill; the game shows skill x 20 + 100, rounded half up (45.65 -> 1013)."""
+    return math.floor(skill * 20 + 100 + 0.5)
+
+
 def parse_skills(result: dict) -> list[Skill]:
     out = []
     for s in result.get("Skills") or []:
         try:
-            out.append(Skill(int(s["Playlist"]), round(float(s["MMR"])), s.get("Tier"), s.get("Division"),
+            out.append(Skill(int(s["Playlist"]), skill_to_mmr(float(s["MMR"])), s.get("Tier"), s.get("Division"),
                              int(s.get("MatchesPlayed") or 0)))
         except (KeyError, TypeError, ValueError):
             continue

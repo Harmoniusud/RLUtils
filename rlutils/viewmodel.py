@@ -148,17 +148,23 @@ def chart(rows: list[tuple[datetime, dict]], table: list | None, gran: str) -> d
         for tier, div, low, high in table:
             tiers.setdefault(tier, []).append((div, low, high))
         order = sorted(tiers, key=lambda t: min(b[1] for b in tiers[t]))
+        starts = [min(b[1] for b in tiers[t]) for t in order]
+        now = series[-1][1]
+        # the rank the latest reading is in; only it and its neighbours get labels and division lines
+        here = max((k for k, s in enumerate(starts) if s <= now), default=0)
         for k, tier in enumerate(order):
-            tl = min(b[1] for b in tiers[tier])
-            th = (min(b[1] for b in tiers[order[k + 1]]) if k + 1 < len(order)
-                  else max(b[2] for b in tiers[tier]) + 1)
+            tl = starts[k]
+            th = starts[k + 1] if k + 1 < len(order) else max(b[2] for b in tiers[tier]) + 1
             a, b = max(tl, lo), min(th, hi)
+            near = abs(k - here) <= 1
             if b > a:
-                bands.append({"lo": a, "hi": b, "label": TIERS[tier] if tier < len(TIERS) else str(tier),
-                              "color": tier_color(tier), "alt": tier % 2})
-            for div, low, _high in sorted(tiers[tier]):
-                if div > 0 and lo < low < hi:
-                    divs.append({"v": low, "label": f"Div {ROMAN[div] if div < 4 else div + 1} · {low}"})
+                roomy = (b - a) / (hi - lo) >= 0.05  # a sliver of a band at the chart's edge: no label
+                bands.append({"lo": a, "hi": b, "label": (TIERS[tier] if tier < len(TIERS) else str(tier))
+                              if near and roomy else "", "color": tier_color(tier), "alt": tier % 2})
+            if near:
+                for div, low, _high in sorted(tiers[tier]):
+                    if div > 0 and lo < low < hi:
+                        divs.append({"v": low, "label": f"Div {ROMAN[div] if div < 4 else div + 1} · {low}"})
     return {"points": points, "bands": bands, "divs": divs, "lo": lo, "hi": hi}
 
 
