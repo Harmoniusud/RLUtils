@@ -2,7 +2,8 @@
 
 A small Windows app for Rocket League players.
 
-- **MMR over time**: your ranked MMR (1v1, 2v2, 3v3) straight from Rocket League's servers after a one-time
+- **MMR over time**: your ranked MMR (1v1, 2v2, 3v3, 4v4 and the extra modes) straight from Rocket League's
+  servers after a one-time
   Epic sign-in, with rank bands, a division gauge, a rank table showing how far you are from every rank and
   division, and history you can import once from tracker.gg.
 - **Games**: every match you finish, with everyone's stats, your playstyle, your teammates, and what your

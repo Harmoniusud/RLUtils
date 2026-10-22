@@ -460,7 +460,7 @@ function setupPanel() {
   const err = T.error ? `<div class="note err">${esc(T.error)}</div>` : "";
   if (T.step === "epic") {
     h += `<div class="mt">${T.required ? "Welcome to " + esc(S.app.title) : "Sign in to Epic"}</div>
-      <div class="lead">${esc(S.app.title)} tracks your MMR for every ranked playlist straight from Rocket League's servers. For that it needs you to sign in to Epic once: your browser opens Epic's sign-in page, and you won't be asked again.</div>
+      <div class="lead">${esc(S.app.title)} tracks your MMR for every ranked playlist (1v1, 2v2, 3v3, 4v4 and the extra modes) straight from Rocket League's servers. For that it needs you to sign in to Epic once: your browser opens Epic's sign-in page, and you won't be asked again.</div>
       <div class="note info" style="line-height:1.5;">${esc(T.privacy)}</div>`;
     if (T.epic.length) h += `<div class="steps">${T.epic.map(a => `<div class="step"><div class="num ok">✓</div><div>Signed in as <b>${esc(a.name)}</b></div></div>`).join("")}</div>`;
     h += `<div class="sub" style="line-height:1.5;">Uses the same unofficial API as Rocket League itself (github.com/dank/rlapi); not made or endorsed by Psyonix or Epic. It isn't used while Rocket League runs, so a session's MMR shows when you close the game.</div>

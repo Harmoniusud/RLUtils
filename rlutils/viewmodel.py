@@ -119,6 +119,11 @@ def gauge(rating: int, tier: int | None, div: int | None, dist) -> dict:
     }
 
 
+CHART_PX = 360  # the chart's height on the page (.chartbox in web/index.html)
+LABEL_PX = 22   # room a rank label needs at the top of its band (11 px text, 6 px down)
+DIV_GAP_PX = 16  # room between division lines for their labels (10 px text above each line)
+
+
 def chart(rows: list[tuple[datetime, dict]], table: list | None, gran: str) -> dict:
     """Points, rank bands and division lines for the MMR chart. rows: (time, snapshot) in the range, oldest
     first. gran: 'raw', 'daily' or 'weekly'. X positions are by point index (as in the design); the page
@@ -144,27 +149,28 @@ def chart(rows: list[tuple[datetime, dict]], table: list | None, gran: str) -> d
                        "time": t.astimezone().strftime("%b %d, %Y %H:%M"), "rank": rank_text(tier, div) or "Rank unknown"})
     bands, divs = [], []
     if table:
+        px = CHART_PX / (hi - lo)  # screen pixels per MMR
         tiers: dict[int, list] = {}
         for tier, div, low, high in table:
             tiers.setdefault(tier, []).append((div, low, high))
         order = sorted(tiers, key=lambda t: min(b[1] for b in tiers[t]))
         starts = [min(b[1] for b in tiers[t]) for t in order]
-        now = series[-1][1]
-        # the rank the latest reading is in; only it and its neighbours get labels and division lines
-        here = max((k for k, s in enumerate(starts) if s <= now), default=0)
         for k, tier in enumerate(order):
             tl = starts[k]
             th = starts[k + 1] if k + 1 < len(order) else max(b[2] for b in tiers[tier]) + 1
             a, b = max(tl, lo), min(th, hi)
-            near = abs(k - here) <= 1
-            if b > a:
-                roomy = (b - a) / (hi - lo) >= 0.05  # a sliver of a band at the chart's edge: no label
-                bands.append({"lo": a, "hi": b, "label": (TIERS[tier] if tier < len(TIERS) else str(tier))
-                              if near and roomy else "", "color": tier_color(tier), "alt": tier % 2})
-            if near:
-                for div, low, _high in sorted(tiers[tier]):
-                    if div > 0 and lo < low < hi:
-                        divs.append({"v": low, "label": f"Div {ROMAN[div] if div < 4 else div + 1} · {low}"})
+            if b <= a:
+                continue
+            # every rank the chart shows is named, unless its band is too thin for the label to fit
+            bands.append({"lo": a, "hi": b, "label": (TIERS[tier] if tier < len(TIERS) else str(tier))
+                          if (b - a) * px >= LABEL_PX else "", "color": tier_color(tier), "alt": tier % 2})
+            # division lines one by one, each only where it reads: clear of the line below it (or the rank's own
+            # bottom edge) and of the rank's label at the band's top. On a long range they'd pile into a smudge.
+            prev = tl
+            for div, low, _high in sorted(tiers[tier]):
+                if div > 0 and lo < low < hi and (low - prev) * px >= DIV_GAP_PX and (b - low) * px >= LABEL_PX:
+                    divs.append({"v": low, "label": f"Div {ROMAN[div] if div < 4 else div + 1} · {low}"})
+                    prev = low
     return {"points": points, "bands": bands, "divs": divs, "lo": lo, "hi": hi}
 
 

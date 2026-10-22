@@ -188,8 +188,10 @@ PLAYLISTS = {
     63: "Heatseeker",
 }
 
-# Only these playlists have MMR tracked by the app.
+# The header's own buttons (1v1 / 2v2 / 3v3); other playlists with readings go under More.
 TRACKED_PLAYLISTS = (10, 11, 13)
+# Playlists whose MMR is saved from Rocket League's servers: every ranked playlist, extra modes included.
+LIVE_PLAYLISTS = TRACKED_PLAYLISTS + (61, 27, 28, 29, 30, 63)
 
 
 def playlist_name(playlist_id: int) -> str:

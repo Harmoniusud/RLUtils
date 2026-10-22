@@ -31,7 +31,7 @@ from PySide6.QtWidgets import (
 
 from . import data, game, importer, psynet, stats, ui, vibrance, viewmodel
 from .data import (
-    APP_NAME, DATA_DIR, DB_PATH, FROZEN, ROOT, THRESHOLDS_PATH, TRACKED_PLAYLISTS, VERSION,
+    APP_NAME, DATA_DIR, DB_PATH, FROZEN, LIVE_PLAYLISTS, ROOT, THRESHOLDS_PATH, TRACKED_PLAYLISTS, VERSION,
     load_config, load_thresholds, playlist_name, rank_label, tier_distance, rl_shortcut_path, save_config,
     switcher_path, switcher_store,
 )
@@ -360,7 +360,7 @@ class PsyNetWatcher(QObject):
         for account, name in self.accounts():
             try:
                 f = psynet.fetch_skills(self.store, account, self.version)
-                results.append(psynet.save(f, TRACKED_PLAYLISTS))
+                results.append(psynet.save(f, LIVE_PLAYLISTS))
             except psynet.LoginExpired:
                 expired.append((account, name))
             except Exception as exc:  # one account failing must not stop the others
@@ -1137,7 +1137,7 @@ class MainWindow(QMainWindow):
         self._build_games()
         self._build_profiles()
         self._readings = len(data.all_snapshots(profile["key"])) if profile else 0
-        live = [(pid, data.latest_snapshot(profile["key"], pid, data.SOURCE_PSYNET)) for pid in TRACKED_PLAYLISTS] \
+        live = [(pid, data.latest_snapshot(profile["key"], pid, data.SOURCE_PSYNET)) for pid in LIVE_PLAYLISTS] \
             if profile else []
         live = [(pid, row) for pid, row in live if row]
         self._live_last = max(live, key=lambda p: datetime.fromisoformat(p[1]["recorded_at"]), default=None)
@@ -1256,7 +1256,8 @@ class MainWindow(QMainWindow):
         title = {"ok": "Live MMR", "busy": "Live MMR · checking", "paused": "Live MMR · paused",
                  "error": "Live MMR · couldn't read it", "off": "Not signed in to Epic"}.get(state, "Live MMR")
         detail = (text + (f" · {names}" if names else "")) if state != "off" else \
-            "Sign in to Epic: your MMR for every ranked playlist comes straight from Rocket League's servers."
+            "Sign in to Epic: your MMR for every ranked playlist (1v1, 2v2, 3v3, 4v4 and the extra modes) " \
+            "comes straight from Rocket League's servers."
         last = getattr(self, "_live_last", None)
         if last:
             pid, row = last
