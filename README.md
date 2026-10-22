@@ -11,12 +11,15 @@ A small Windows app for Rocket League players.
 - **Play**: starts Rocket League (Epic or Steam, or any shortcut you pick), optionally switching the Epic
   launcher to one of your saved accounts first.
 - **Vibrance**: NVIDIA Digital Vibrance while Rocket League is in front, optionally mirrored into OBS.
+- **Overlay**: your MMR, the session's MMR change (+/−), record, streak and more on top of the game, with
+  toggles for every line, position, size, opacity and layout. Needs Borderless or Windowed mode;
+  Ctrl+Shift+O hides and shows it.
 
 ## Download
 
 Get `RLUtils-Setup-<version>.exe` (installer) or `RLUtils-<version>.zip` (portable) from
 [Releases](../../releases). Windows 10/11, 64-bit. On first start a short setup has you sign in to Epic in your
-browser, finds the game, and offers to switch on Rocket League's Stats API. When a newer version is out,
+browser, offers an optional spare Epic account, finds the game, and offers to switch on Rocket League's Stats API. When a newer version is out,
 the app offers to update itself (Settings > Check for updates); your data and sign-in stay.
 
 ## What it reads and changes
@@ -26,8 +29,14 @@ the app offers to update itself (Settings > Check for updates); your data and si
   encrypted with Windows DPAPI so only your Windows user on this PC can read it, and sends it only to Epic and
   Rocket League's servers to read your MMR for every ranked playlist. This uses Rocket League's unofficial API
   the way [dank/rlapi](https://github.com/dank/rlapi) does (not made or endorsed by Psyonix or Epic). It is
-  checked when the app starts, when the game closes and every 30 minutes, never while the game runs.
-  Settings > Epic sign-in signs you out and removes the sign-in from Epic too.
+  checked when the app starts, right after each ranked match ends, when the game closes and every 30 minutes
+  while it's closed. Settings > Epic sign-in signs you out and removes the sign-in from Epic too.
+- **Spare account** (optional, recommended): Rocket League's servers allow one sign-in per player, so a read
+  while the game is open drops the game's connection for a few seconds ("Duplicate login detected"). Without a
+  spare that happens on the end screen, never during a match. With a spare Epic account (one you don't play
+  on), RLUtils signs in as the spare and asks for your MMR instead, so the game is never disconnected, and it
+  also reads as each match starts, which gives every game its exact MMR change.
+- **Overlay**: a separate click-through, always-on-top window; nothing is drawn inside the game.
 - **Games** come from the [Stats API](https://www.rocketleague.com/developer/stats-api), which the game serves
   on 127.0.0.1 once `PacketSendRate` is above 0. RLUtils only listens.
 - **Enable Stats API** (setup or Settings) sets `PacketSendRate=10` in the game folder's
@@ -67,6 +76,7 @@ powershell -ExecutionPolicy Bypass -File packaging\release.ps1     # dist\RLUtil
 | `rlutils/game.py` | finding and starting the game; the account switcher |
 | `rlutils/data.py` | settings and the SQLite database |
 | `rlutils/vibrance.py` | NVIDIA vibrance (NVAPI) and the OBS filter |
+| `rlutils/hud.py` | the in-game overlay window, and when and where it shows |
 | `rlutils/assets/` | the account switcher script, rank table, icons |
 | `packaging/` | build, release, installer script, notices and third-party licenses |
 

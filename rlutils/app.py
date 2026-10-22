@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import queue
+import re
 import subprocess
 import sys
 import tempfile
@@ -20,7 +21,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, QObject, QTimer, QUrl, Qt, Signal, Slot
-from PySide6.QtGui import QAction, QColor, QDesktopServices
+from PySide6.QtGui import QAction, QColor, QDesktopServices, QGuiApplication
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWebChannel import QWebChannel
 from PySide6.QtWebEngineCore import QWebEnginePage
@@ -29,7 +30,7 @@ from PySide6.QtWidgets import (
     QApplication, QFileDialog, QMainWindow, QMenu, QSystemTrayIcon,
 )
 
-from . import data, game, importer, psynet, stats, ui, vibrance, viewmodel
+from . import data, game, hud, importer, psynet, stats, ui, vibrance, viewmodel
 from .data import (
     APP_NAME, DATA_DIR, DB_PATH, FROZEN, LIVE_PLAYLISTS, ROOT, THRESHOLDS_PATH, TRACKED_PLAYLISTS, VERSION,
     load_config, load_thresholds, playlist_name, rank_label, tier_distance, rl_shortcut_path, save_config,
@@ -240,6 +241,7 @@ class EpicSignIn(QObject):
         self.state = "idle"   # idle, starting, waiting, saving, error
         self.error = ""
         self.busy = False
+        self.spare = False    # this sign-in is for the spare account (Settings > Spare account)
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._poll)
 
@@ -269,7 +271,7 @@ class EpicSignIn(QObject):
 
     def cancel(self) -> None:
         self.timer.stop()
-        self.state, self.login, self.error = "idle", None, ""
+        self.state, self.login, self.error, self.spare = "idle", None, "", False
         self.changed.emit()
 
     def _poll(self) -> None:
@@ -304,16 +306,28 @@ class EpicSignIn(QObject):
         if self.state == "idle":
             return None
         return {"state": self.state, "code": self.login.user_code if self.login else "",
-                "url": self.login.url if self.login else "", "error": self.error}
+                "url": self.login.url if self.login else "", "error": self.error, "spare": self.spare}
 
 
 class PsyNetWatcher(QObject):
     """Live MMR from Rocket League's servers (psynet.py) for every Epic account signed in here: when the app
-    starts, when Rocket League closes (so the last match counts), and every `psynet.every_min` minutes while
-    it isn't running. Never while it runs: signing into PsyNet beside the game could drop the game's session."""
+    starts, right after each ranked match ends (`psynet.after_game_s`, unless the next match has started), when
+    Rocket League closes, and every `psynet.every_min` minutes while it isn't running.
+
+    Reads beside the running game sign into PsyNet a second time as the player, which drops the game's own
+    connection (DuplicateLogin) until it reconnects, so never during a match. With a spare Epic account
+    (psynet.spare, Settings) they sign in as the spare instead and leave the game alone, and then a read is
+    also made as each ranked match starts. Every read goes to psynet.log in the data folder and, for reads
+    with the game open, what followed: the game still running, the Stats API still connected, and Rocket
+    League's own Launch.log lines about connections and sign-ins in the next 90 s (long tokens redacted)."""
 
     saved = Signal(str, int)    # profile key, new readings
     status = Signal()
+
+    WATCH_S = (20, 90)          # after a read with the game open: when to look at what followed
+    MIN_GAP_S = 120             # a match-start read this soon after the last read adds nothing
+    LOG_WORDS = re.compile(r"psynet|disconnect|logg?ed (in|out)|log ?in|log ?out|auth|kick|connection|reconnect"
+                           r"|session|signed|timed? ?out|lost|error|fail", re.I)
 
     def __init__(self, window: "MainWindow"):
         super().__init__(window)
@@ -325,11 +339,108 @@ class PsyNetWatcher(QObject):
         self.state = ("wait", "Starting")
         self.last_at: datetime | None = None
         self.expired: set[str] = set()   # accounts whose sign-in stopped working: asked to sign in again
+        self.reason = ""
+        self.in_game = False             # the running read was made with Rocket League open
+        self.fallback = True             # ...and may read as the player if the spare account can't
+        self.spare_state = ("", "")      # how the last read through the spare account went
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.tick)
+        self.after = QTimer(self)        # the one pending after-game read: a later match's end replaces it
+        self.after.setSingleShot(True)
+        self.after.timeout.connect(self._after_game_read)
+        self.after_pl: int | None = None
+        self.after_ended: datetime | None = None
+
+    # --- psynet.log: what each read did, and what the game did after one made beside it ----------------------
+
+    @staticmethod
+    def log(line: str) -> None:
+        try:
+            path = DATA_DIR / "psynet.log"
+            if path.exists() and path.stat().st_size > 1_000_000:
+                path.replace(path.with_suffix(".log.old"))
+            with path.open("a", encoding="utf-8") as f:
+                f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} {line}\n")
+        except OSError:
+            pass
+
+    @staticmethod
+    def _launch_log() -> Path:
+        return stats.rocket_league_dir() / "TAGame" / "Logs" / "Launch.log"
+
+    def _game_state(self) -> str:
+        g = self.window.games
+        live = g.feed.live
+        match = f"in a match ({playlist_name(live['playlist'])})" if live and live.get("playlist") is not None \
+            else "not in a match"
+        return f"Rocket League {'open' if self.window._rl_running else 'closed'}, Stats API {g.link}, {match}"
+
+    def _watch(self, offset: int, seconds: int, last: bool) -> None:
+        self.log(f"  +{seconds} s after the read: {self._game_state()}")
+        if not last:
+            return
+        try:
+            with self._launch_log().open("rb") as f:
+                f.seek(offset)
+                text = f.read(2_000_000).decode("utf-8", "replace")
+        except OSError as exc:
+            self.log(f"  Launch.log: can't read it ({exc})")
+            return
+        lines = [ln.strip() for ln in text.splitlines() if self.LOG_WORDS.search(ln)]
+        self.log(f"  Launch.log since the read: {len(text.splitlines())} lines, {len(lines)} about connections/sign-in"
+                 + (":" if lines else ""))
+        for ln in lines[:80]:
+            self.log("    " + re.sub(r"[A-Za-z0-9+/=_-]{24,}", "<redacted>", ln)[:300])
+
+    # --- reads ---------------------------------------------------------------------------------------------
+
+    def spare(self) -> str:
+        """The spare Epic account (psynet.spare) when it's still signed in here, else ""."""
+        spare = str(self.window.cfg["psynet"].get("spare") or "").lower()
+        return spare if spare and spare in self.store.load() else ""
+
+    def match_started(self, playlist_id: int) -> None:
+        """A ranked match is starting (Stats API). With a spare account: read now (through it), so the match has a
+        reading just before it. Without one, no read: on 22 Oct 2026 a read here dropped the game's own PsyNet
+        connection mid-match (Launch.log: Reason=DuplicateLogin) and the match lagged until it reconnected; the
+        read after the previous match is then the reading before this one."""
+        if playlist_id not in LIVE_PLAYLISTS:
+            return
+        if not self.spare():
+            self.log(f"{playlist_name(playlist_id)} match starting: no read during a match (no spare account)")
+            return
+        if self.last_at and (datetime.now(timezone.utc) - self.last_at).total_seconds() < self.MIN_GAP_S:
+            self.log(f"{playlist_name(playlist_id)} match starting: read {self.MIN_GAP_S} s ago or less, not again")
+            return
+        self.tick(reason=f"{playlist_name(playlist_id)} match starting", in_game=True, fallback=False)
+
+    def after_game(self, playlist_id: int) -> None:
+        """A ranked match ended (Stats API): read straight away (`psynet.after_game_s`, 0), on the end screen,
+        so the game's sign-in has reconnected before the next match."""
+        if playlist_id not in LIVE_PLAYLISTS:
+            return
+        wait = max(0, int(self.window.cfg["psynet"].get("after_game_s", 0)))
+        self.log(f"{playlist_name(playlist_id)} match ended: reading in {wait} s"
+                 + (" (instead of the one still waiting)" if self.after.isActive() else ""))
+        self.after_pl, self.after_ended = playlist_id, datetime.now(timezone.utc)
+        self.after.start(wait * 1000)
+
+    def _after_game_read(self) -> None:
+        feed = self.window.games.feed
+        live = feed.live
+        # the ended match stays in the feed (done) until MatchDestroyed: only a match still going is the next one
+        if live and live.get("playlist") is not None and not feed.done:
+            self.log("after-game read skipped: the next match has already started (the read after it covers both)")
+            return
+        if self.last_at and self.after_ended and self.last_at > self.after_ended:
+            self.log("after-game read skipped: already read since that match ended")
+            return
+        self.tick(reason=f"after a {playlist_name(self.after_pl)} match", in_game=True)
 
     def accounts(self) -> list[tuple[str, str]]:
-        return self.store.accounts()
+        """The players whose MMR is tracked: everyone signed in but the spare account."""
+        spare = self.spare()
+        return [(a, n) for a, n in self.store.accounts() if a != spare]
 
     def start(self) -> None:
         if data.drop_raw_psynet_readings():
@@ -342,38 +453,80 @@ class PsyNetWatcher(QObject):
             self.state = (state, text)
             self.status.emit()
 
-    def tick(self) -> None:
+    def tick(self, reason: str = "timer", in_game: bool = False, fallback: bool = True) -> None:
+        """Read now. With Rocket League open only for the match-start and after-game reads (`in_game`); the
+        timer and the other callers wait for it to close. With the game open the read goes through the spare
+        account when there is one; if that fails, `fallback` (the after-game read, on the end screen) reads as the
+        player after all, which briefly drops the game's connection."""
         if self.busy:
+            if in_game:
+                self.log(f"read ({reason}) skipped: a read is already running")
             return
         if not self.accounts():
             self._status("off", "Not signed in to Epic")
             return
-        if self.window._rl_running:
-            self._status("paused", "Paused while Rocket League runs; updates when you close it")
+        if self.window._rl_running and not in_game:
+            self._status("paused", "Rocket League is open: reads as each ranked match starts and right after it ends"
+                         if self.spare() else "Rocket League is open: reads right after each ranked match ends")
             return
-        self.busy = True
+        self.busy, self.reason, self.in_game = True, reason, self.window._rl_running
+        self.fallback = fallback
+        spare = self.spare() if self.in_game else ""
+        self.log(f"read ({reason}{', through the spare account' if spare else ''}): {self._game_state()}")
+        if self.in_game:  # watch what the game does after this read
+            try:
+                offset = self._launch_log().stat().st_size
+            except OSError:
+                offset = 0
+            for i, s in enumerate(self.WATCH_S):
+                QTimer.singleShot(s * 1000, lambda s=s, last=i == len(self.WATCH_S) - 1: self._watch(offset, s, last))
         self._status("busy", "Reading MMR from Rocket League's servers…")
         self.bg.run(self._work, self._done)
 
     def _work(self):
         results, errors, expired = [], [], []
+        spare = self.spare() if self.in_game else ""
+        spare_err = None   # why the spare couldn't read (None: not used, or it worked)
         for account, name in self.accounts():
             try:
+                if spare and spare_err is None:
+                    try:
+                        f = psynet.fetch_skills(self.store, account, self.version, spare=spare)
+                        results.append(psynet.save(f, LIVE_PLAYLISTS))
+                        continue
+                    except psynet.LoginExpired:
+                        spare_err = "its sign-in stopped working: sign it in again in Settings"
+                    except Exception as exc:
+                        spare_err = str(exc)
+                if spare and not self.fallback:
+                    errors.append(f"{name or account[:6]}: not read (the spare account couldn't: {spare_err})")
+                    continue
                 f = psynet.fetch_skills(self.store, account, self.version)
                 results.append(psynet.save(f, LIVE_PLAYLISTS))
             except psynet.LoginExpired:
                 expired.append((account, name))
             except Exception as exc:  # one account failing must not stop the others
                 errors.append(f"{name or account[:6]}: {exc}")
-        return results, errors, expired
+        return results, errors, expired, (spare, spare_err)
 
     def _done(self, res, err) -> None:
         self.busy = False
         if err:
+            self.log(f"  read failed: {err}")
             self._status("error", str(err))
             return
-        results, errors, expired = res
+        results, errors, expired, (spare, spare_err) = res
+        if spare:
+            now = f"{datetime.now():%H:%M}"
+            self.spare_state = (("error", f"Couldn't read through it at {now}: {spare_err}"
+                                 + (". Read as you instead, on the end screen" if self.fallback else ""))
+                                if spare_err else ("ok", f"Last read through it at {now}, with Rocket League open"))
+            if spare_err:
+                self.log(f"  spare account: {spare_err}" + ("; read as the player instead" if self.fallback else ""))
         self.last_at = datetime.now(timezone.utc)
+        self.log("  done: " + "; ".join([f"{key}: {added} new reading{'s' if added != 1 else ''}"
+                                         for key, added in results] + [f"error {e}" for e in errors]
+                                        + [f"{n or a[:6]}: sign-in expired" for a, n in expired]))
         for key, added in results:
             if added:
                 self.saved.emit(key, added)
@@ -495,6 +648,8 @@ class GamesWatcher(QObject):
     match: to the profile of your account in it (added the first time). Only listens; never sends to the game."""
 
     saved = Signal(str, str)   # profile key, one-line summary
+    started = Signal(int)      # an online match's playlist id, once per match, as soon as the feed knows it
+    ended = Signal(int)        # a saved match's playlist id (live MMR reads again after it)
     status = Signal(str, str)  # state ("ok", "live", "wait", "error", "off"), text
 
     def __init__(self, window: "MainWindow"):
@@ -508,6 +663,7 @@ class GamesWatcher(QObject):
                                    on_rate=lambda line: self.events.put(("rate", line)))
         self.link = "waiting"
         self.last = ""  # last saved / skipped line
+        self.started_guid = ""  # the match `started` was sent for
         self.state = ("off", "Game stats off")
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._drain)
@@ -563,6 +719,10 @@ class GamesWatcher(QObject):
             elif kind == "game":
                 self._save(value)
         live = self.feed.live
+        guid = self.feed.guid
+        if live and live.get("playlist") is not None and live.get("online") and guid and guid != self.started_guid:
+            self.started_guid = guid
+            self.started.emit(live["playlist"])
         if self.link == "off":
             self._status("error", self.last)
         elif self.link == "waiting":
@@ -605,6 +765,7 @@ class GamesWatcher(QObject):
         self.last = f"{datetime.now():%H:%M} saved {line}" if gid else f"{datetime.now():%H:%M} already saved"
         if gid:
             self.saved.emit(key, line)
+            self.ended.emit(rec.playlist_id)
 
 
 class Bridge(QObject):
@@ -663,7 +824,7 @@ class MainWindow(QMainWindow):
     """A frameless window holding the web UI (rlutils/web): title bar, rail, header, pages and status bar are
     all drawn by the page. Python keeps the state and does the work; the page shows it and sends clicks."""
 
-    PAGES = ["MMR", "Games", "Play", "Settings"]
+    PAGES = ["MMR", "Games", "Play", "Overlay", "Settings"]
     profile_renamed = Signal(str, str)  # old key, new key (emitted from any thread; handled on the UI thread)
 
     def __init__(self, start_hidden: bool = False):
@@ -727,6 +888,8 @@ class MainWindow(QMainWindow):
         self.games = GamesWatcher(self)
         self.games.status.connect(lambda _s, _t: self.push())
         self.games.saved.connect(self._on_game_saved)
+        self.games.started.connect(lambda pid: self.live.match_started(pid))
+        self.games.ended.connect(lambda pid: self.live.after_game(pid))
         self.live = PsyNetWatcher(self)
         self.live.status.connect(self.push)
         self.live.saved.connect(self._on_live_saved)
@@ -735,10 +898,13 @@ class MainWindow(QMainWindow):
         self.signin.signed_in.connect(self._signed_in)
         self.updates = UpdateChecker(self)
         self.updates.found.connect(self.push)
+        self.hud = hud.HudController(self, lambda: self.cfg["hud"], self._hud_content, lambda: self._rl_running)
+        self.hud.changed.connect(self.push)
         self.vibrance.start()
         self.games.start()
         self.live.start()
         self.updates.start()
+        self.hud.start()
         self.reload_accounts()
         if not self.cfg["app"].get("setup_done") or not self.live.accounts():
             self.open_setup()  # the Epic sign-in is required; on first start also the game and the Stats API
@@ -750,7 +916,7 @@ class MainWindow(QMainWindow):
         self.clock.timeout.connect(self.push)
         self.clock.start(20_000)
         self._poll()
-        for i in range(len(self.PAGES)):  # Ctrl+1..4 also when the page doesn't have focus
+        for i in range(len(self.PAGES)):  # Ctrl+1..5 also when the page doesn't have focus
             act = QAction(self)
             act.setShortcut(f"Ctrl+{i + 1}")
             act.triggered.connect(lambda _checked=False, n=i: self.go(self.PAGES[n]))
@@ -780,16 +946,19 @@ class MainWindow(QMainWindow):
             "importConfirm": lambda _v: self._import_confirm(), "importBack": lambda _v: self._import_back(),
             "importCancel": lambda _v: self._import_close(),
             "setupOpen": lambda v: self.open_setup(v if v in self.SETUP_STEPS else "epic"),
-            "setupGo": self._setup_go, "setupFinish": self._setup_finish,
+            "setupGo": self._setup_go, "setupFinish": self._setup_finish, "setupImport": self._setup_import,
             "findGame": self._find_game, "chooseGame": self._choose_game, "setLaunch": self._set_launch,
             "enableStats": self._enable_stats,
             "epicLogin": lambda _v: self.open_epic_login(), "epicLogout": self._epic_logout,
             "epicOpen": lambda _v: self.signin.open_page(), "epicCancel": lambda _v: self.signin.cancel(),
+            "spareLogin": lambda _v: self.open_epic_login(spare=True), "spareRemove": self._spare_remove,
             "liveRefresh": lambda _v: self.live.tick(),
             "updateOpen": self._ask_update, "updateInstall": lambda _v: self.updates.install(),
             "updatePage": lambda _v: self.updates.latest and QDesktopServices.openUrl(QUrl(self.updates.latest["url"])),
             "updateSkip": self._skip_update,
             "setVibrance": self._set_vibrance, "toggleObs": self._toggle_obs,
+            "hudToggle": self._hud_toggle, "hudSet": self._hud_set, "hudPreview": lambda _v: self.hud.preview(),
+            "hudReset": self._hud_reset,
             "toggle": self._toggle_setting, "setPath": self._set_path, "browse": self._browse,
             "import": lambda _v: self.open_import(),
             "export": lambda _v: self.export_history(),
@@ -872,6 +1041,7 @@ class MainWindow(QMainWindow):
             {"label": "Play", "a": "play", "right": account["name"] if account else ""},
             {"label": "Import MMR history…", "a": "import"},
             {"label": "Vibrance", "a": "vibrance", "right": f"{int(self.cfg['vibrance']['pct'])}%"},
+            {"label": "In-game overlay", "a": "overlay", "check": bool(self.cfg["hud"]["enabled"]), "right": "Ctrl+Shift+O"},
             {"sep": True},
             {"label": "Start with Windows", "a": "autostart", "check": is_enabled()},
             {"label": "Quit", "a": "quit"},
@@ -907,6 +1077,8 @@ class MainWindow(QMainWindow):
         elif a == "vibrance":
             self.show_from_tray()
             self.go("Play")
+        elif a == "overlay":
+            self._hud_toggle("enabled")
         elif a == "autostart":
             self._set_autostart(not is_enabled())
         elif a == "quit":
@@ -923,6 +1095,7 @@ class MainWindow(QMainWindow):
         self._quitting = True
         self.live.timer.stop()
         self.games.stop()
+        self.hud.stop()
         self.vibrance.restore()
         if self.tray:
             self.tray.hide()
@@ -1245,7 +1418,7 @@ class MainWindow(QMainWindow):
             "live": self._live_view(), "signin": self.signin.view(), "imp": self._import_view(), "setup": self._setup_view(),
             "api": self._api_view(), "play": self._play_view(),
             "settings": self._settings_view(profile), "status": self._status_view(), "tray": self._tray_items(),
-            "update": self._update_view(),
+            "update": self._update_view(), "hud": self._hud_view(),
         }
 
     def _live_view(self) -> dict:
@@ -1268,8 +1441,10 @@ class MainWindow(QMainWindow):
             last_text = "No readings yet for this profile"
         return {"on": bool(names), "busy": state == "busy", "color": color, "title": title, "detail": detail,
                 "last": last_text,
-                "note": "Checked when the app starts, when Rocket League closes and every "
-                        f"{int(self.cfg['psynet'].get('every_min', 30))} minutes; never while the game runs.",
+                "note": "Checked when the app starts, " + ("as each ranked match starts (through your spare account), "
+                                                            if self.live.spare() else "") +
+                        "right after each ranked match ends, when Rocket League "
+                        f"closes, and every {int(self.cfg['psynet'].get('every_min', 30))} minutes while it's closed.",
                 "short": {"ok": "live", "busy": "checking", "paused": "paused", "error": "error"}.get(state, "off")}
 
     def _epic_rows(self) -> list[dict]:
@@ -1300,11 +1475,24 @@ class MainWindow(QMainWindow):
         self.modal(title, f"{lead}\n\n{PRIVACY_TEXT}",
                    [{"label": "Not now"}, {"label": "Sign in with Epic", "a": "epicLogin", "primary": True}])
 
-    def open_epic_login(self) -> None:
-        """Epic's sign-in in the user's browser; the page shows the code to approve and waits (EpicSignIn)."""
+    def open_epic_login(self, spare: bool = False) -> None:
+        """Epic's sign-in in the user's browser; the page shows the code to approve and waits (EpicSignIn).
+        spare: for the spare account (it reads MMR while the game runs and isn't tracked itself)."""
+        if self.signin.state == "idle":
+            self.signin.spare = spare
+            # the accounts tracked now: the new sign-in is saved before _signed_in runs, so it can't tell later
+            self._tracked_before = {a for a, _n in self.live.accounts()}
         self.signin.start()
 
     def _signed_in(self, account: str, name: str) -> None:
+        account = account.lower()
+        if self.signin.spare:
+            self.signin.spare = False
+            self._spare_signed_in(account, name)
+            return
+        if self.cfg["psynet"].get("spare", "").lower() == account:  # the spare, signed in as a tracked account now
+            self.cfg["psynet"]["spare"] = ""
+            save_config(self.cfg)
         self.live.expired.discard(account)
         self._offer_once(account)
         key = data.profile_for_epic_account(account, name)
@@ -1313,10 +1501,64 @@ class MainWindow(QMainWindow):
             if self._setup.get("forced"):
                 self._setup = None  # already set up: only the sign-in was missing
             else:
-                self._setup.update(step="game", error="")
+                self._setup.update(step="spare", error="")
         self.message(f"Signed in to Epic as {name or account[:6]}: reading your MMR")
         self.live.tick()
         self.push()
+
+    def _spare_signed_in(self, account: str, name: str) -> None:
+        label = name or account[:6]
+        played = {p["player_id"].lower() for p in data.list_profiles()  # accounts with games saved: played on
+                  if p["player_id"] and data.game_playlists(p["key"])}
+        if account in getattr(self, "_tracked_before", set()) or data.epic_player_id(account).lower() in played:
+            self.modal("That's not a spare account",
+                       f"You signed in as {label}, whose MMR RLUtils tracks. The spare has to be a different Epic "
+                       "account, one you don't play on.\n\nYour browser was still signed in to Epic as "
+                       f"{label}. Sign out on epicgames.com first (or open the sign-in link in a private window), "
+                       "then click Add spare account again and sign in with the spare.")
+            return
+        old = self.live.spare()
+        self.cfg["psynet"]["spare"] = account
+        save_config(self.cfg)
+        if old and old != account:
+            self.bg.run(lambda: psynet.sign_out(self.live.store, old), lambda _r, _e: None)
+        self.live.spare_state = ("", "")
+        self.message(f"Spare account {label} added: with Rocket League open, MMR is now read through it, "
+                     "as each ranked match starts and right after it ends", 10)
+        self.push()
+
+    def _spare_remove(self, _v=None) -> None:
+        spare = self.live.spare()
+        self.cfg["psynet"]["spare"] = ""
+        save_config(self.cfg)
+        self.live.spare_state = ("", "")
+        if spare:
+            self.bg.run(lambda: psynet.sign_out(self.live.store, spare), lambda _r, _e: self.push())
+        self.message("Spare account removed: with Rocket League open, MMR is read only right after each ranked "
+                     "match ends", 10)
+
+    def _spare_view(self) -> dict:
+        spare = self.live.spare()
+        name = self.live.store.load().get(spare, {}).get("name", "") if spare else ""
+        state, text = self.live.spare_state
+        return {
+            "on": bool(spare), "name": name or spare[:6], "id": spare,
+            "state": text or ("Not used yet: it reads the next time a ranked match starts or ends with Rocket "
+                              "League open" if spare else ""),
+            "stateColor": viewmodel.LOSS if state == "error" else viewmodel.WIN if state == "ok" else viewmodel.MUTED,
+            "why": ("Rocket League's servers allow one sign-in per player. When RLUtils reads your MMR while the game "
+                    "is open, it signs in as you, and the game's own connection is dropped (\"Duplicate login "
+                    "detected\") until it reconnects a few seconds later. In a match that means lag."),
+            "without": ("Without a spare: with the game open, MMR is read only right after each ranked match "
+                        "ends, on the end screen. The game may show the duplicate-login message there and "
+                        "reconnects before your next match. Nothing is read during a match."),
+            "with": ("With a spare: RLUtils signs in as the spare instead and asks for your MMR, so your game is "
+                     "never disconnected. Then it also reads as each match starts, which gives every game its "
+                     "exact MMR change."),
+            "how": ("Use any free Epic account you don't play on (a new one is fine; it doesn't need Rocket League "
+                    "played). Your browser may still be signed in to Epic as your main account: sign out on "
+                    "epicgames.com first, or open the sign-in link in a private window."),
+        }
 
     def _epic_logout(self, account) -> None:
         account = str(account or "")
@@ -1483,7 +1725,7 @@ class MainWindow(QMainWindow):
             "rl": self._rl_view(),
             "data": f"{DB_PATH.name} · {size} · {readings:,} readings · {len(self._games_all):,} games",
             "dataDir": str(DATA_DIR),
-            "epic": self._epic_rows(), "privacy": PRIVACY_TEXT,
+            "epic": self._epic_rows(), "privacy": PRIVACY_TEXT, "spare": self._spare_view(),
         }
 
     def _installs(self) -> list[dict]:
@@ -1722,6 +1964,155 @@ class MainWindow(QMainWindow):
             else:
                 self.updates.latest = None
 
+    # --- the in-game overlay (rlutils/hud.py; the Overlay page) -----------------
+
+    HUD_NUMBERS = {"dx": (0, 2000), "dy": (0, 2000), "scale": (50, 250), "opacity": (20, 100), "bg": (0, 100)}
+    HUD_CHOICES = {"anchor": hud.ANCHORS, "layout": hud.LAYOUTS, "when": hud.WHEN}
+
+    def _rows(self, pid: int) -> list[tuple[datetime, dict]]:
+        """(time, reading) of a playlist for the current profile, oldest first (kept until the next refresh)."""
+        if pid not in self._snaps:
+            profile = self.current_profile()
+            self._snaps[pid] = [(datetime.fromisoformat(r["recorded_at"]), r)
+                                for r in (data.list_snapshots(profile["key"], pid) if profile else [])]
+        return self._snaps[pid]
+
+    def _hud_live(self) -> dict | None:
+        return self.games.feed.live if self.games.state[0] == "live" else None
+
+    def _hud_since(self) -> datetime | None:
+        try:
+            return datetime.fromisoformat(self.cfg["hud"]["session_since"]) if self.cfg["hud"]["session_since"] else None
+        except ValueError:
+            return None
+
+    def _hud_pid(self) -> int:
+        """The overlay's playlist: the one set, or on Auto the ranked match being played, else the last ranked
+        game, else the playlist the MMR page shows."""
+        want = self.cfg["hud"]["playlist"]
+        if want != "auto":
+            return int(want)
+        live = self._hud_live()
+        if live and live.get("playlist") in LIVE_PLAYLISTS:
+            return live["playlist"]
+        return next((g["playlist_id"] for g in self._games_all if g["playlist_id"] in LIVE_PLAYLISTS), self.playlist)
+
+    def _hud_content(self) -> dict:
+        profile, pid = self.current_profile(), self._hud_pid()
+        dist = self._distance(profile, pid)[1] if profile else None
+        return viewmodel.hud(self._games_all, self._rows(pid), pid, self.thresholds.get(pid), dist, self._gap(),
+                             datetime.now(timezone.utc), self._hud_since(), self._hud_live(), self.cfg["hud"]["show"])
+
+    def _hud_screens(self) -> list[dict]:
+        out = [{"id": "auto", "label": "Rocket League's"}]
+        primary = QGuiApplication.primaryScreen()
+        for i, s in enumerate(QGuiApplication.screens()):
+            g = s.geometry()
+            out.append({"id": s.name(), "label": f"{i + 1}{' (main)' if s is primary else ''}",
+                        "title": f"{g.width()}×{g.height()}"})
+        return out
+
+    def _hud_view(self) -> dict:
+        cfg = self.cfg["hud"]
+        content = self._hud_content()
+        state, text = self.hud.status
+        if cfg["enabled"] and cfg["hotkey"] and not self.hud.hotkey_ok:
+            text += " · Ctrl+Shift+O is taken by another program"
+        screen = self.hud._screen(cfg)
+        geo = screen.geometry() if screen else None
+        ses = content["session"]
+        start = ses["start"]
+        now = datetime.now(timezone.utc)
+        run = viewmodel.session_games(self._games_all, self._gap(), now, self._hud_since())
+        per = []
+        for pid in dict.fromkeys(g["playlist_id"] for g in run):
+            games = [g for g in run if g["playlist_id"] == pid]
+            w = sum(1 for g in games if g["won"])
+            d = viewmodel.session_delta(self._rows(pid), start) if pid in LIVE_PLAYLISTS else None
+            per.append({"name": viewmodel.short(pid), "wl": f"{w}W – {len(games) - w}L",
+                        "delta": "—" if d is None else viewmodel.sign(d),
+                        "color": viewmodel.MUTED if not d else viewmodel.WIN if d > 0 else viewmodel.LOSS})
+        n, wins = ses["games"], ses["wins"]
+        since = self._hud_since()
+        if since:
+            since = since.astimezone()
+            day = "" if since.date() == datetime.now().date() else f" {since:%d %b}"
+        session = {
+            "on": bool(n),
+            "title": (f"Since {start.astimezone():%H:%M} · {viewmodel.duration(now - start)}" if start
+                      else "No session going: it starts with your next game"),
+            "stats": [["Games", str(n), viewmodel.TEXT], ["Record", f"{wins}W – {n - wins}L", viewmodel.TEXT],
+                      ["Win rate", viewmodel.pct(wins, n), viewmodel.TEXT]],
+            "per": per,
+            "reset": f"Reset at {since:%H:%M}{day}: earlier games don't count" if since else "",
+            "gap": int(self.cfg.get("session_gap_min", 30)),
+        }
+        pls = [{"id": "auto", "label": "Auto"}] + [{"id": p, "label": viewmodel.short(p)} for p in LIVE_PLAYLISTS]
+        return {
+            "cfg": {k: cfg[k] for k in ("enabled", "playlist", "anchor", "dx", "dy", "screen", "scale", "opacity", "bg",
+                                        "layout", "when", "hotkey", "hide_capture")},
+            "items": [{"id": k, "label": label, "sub": sub, "on": bool(cfg["show"].get(k))}
+                      for k, label, sub in viewmodel.HUD_ITEMS],
+            "preview": {"title": content["title"], "items": content["items"]},
+            "pidLabel": viewmodel.short(content["pid"]),
+            "status": {"state": state, "text": text,
+                       "color": {"on": viewmodel.WIN, "idle": viewmodel.WARN}.get(state, viewmodel.FAINT)},
+            "playlists": pls, "screens": self._hud_screens(),
+            "screenSize": [geo.width(), geo.height()] if geo else [1920, 1080],
+            "session": session,
+        }
+
+    def _hud_toggle(self, key) -> None:
+        cfg = self.cfg["hud"]
+        if key in ("enabled", "hotkey", "hide_capture"):
+            cfg[key] = not cfg[key]
+            if key == "enabled" and cfg[key]:
+                self.hud.hidden = False
+                self.hud.preview()  # show where it is straight away, even with the game closed
+        elif isinstance(key, str) and key.startswith("show.") and key[5:] in {k for k, *_ in viewmodel.HUD_ITEMS}:
+            cfg["show"][key[5:]] = not cfg["show"].get(key[5:])
+        else:
+            return
+        save_config(self.cfg)
+        self.hud.tick()
+
+    def _hud_set(self, v) -> None:
+        """{key, value, save}: one overlay setting. save false while a slider is dragged (applied, not written)."""
+        if not isinstance(v, dict):
+            return
+        key, value, cfg = v.get("key"), v.get("value"), self.cfg["hud"]
+        if key in self.HUD_NUMBERS:
+            lo, hi = self.HUD_NUMBERS[key]
+            try:
+                cfg[key] = max(lo, min(hi, int(value)))
+            except (TypeError, ValueError):
+                return
+        elif key in self.HUD_CHOICES and value in self.HUD_CHOICES[key]:
+            cfg[key] = value
+        elif key == "playlist" and (value == "auto" or value in LIVE_PLAYLISTS):
+            cfg[key] = value
+        elif key == "screen" and (value == "auto" or value in [s.name() for s in QGuiApplication.screens()]):
+            cfg[key] = value
+        elif key == "gap":
+            try:
+                self.cfg["session_gap_min"] = max(10, min(180, int(value)))
+            except (TypeError, ValueError):
+                return
+            self._positions = viewmodel.session_positions(self._games_all, self._gap())
+            self._build_games()
+        else:
+            return
+        if v.get("save", True):
+            save_config(self.cfg)
+        self.hud.tick()
+
+    def _hud_reset(self, v) -> None:
+        """Reset session: games before now stop counting (v "clear": count them again)."""
+        self.cfg["hud"]["session_since"] = "" if v == "clear" else datetime.now(timezone.utc).isoformat()
+        save_config(self.cfg)
+        self.message("Session reset: the overlay counts from now." if v != "clear" else "Session reset undone.", 6)
+        self.hud.tick()
+
     def _skip_update(self, _v=None) -> None:
         if self.updates.latest:
             self.cfg["app"]["skip_version"] = self.updates.latest["version"]
@@ -1854,16 +2245,24 @@ class MainWindow(QMainWindow):
         else:
             self.modal("Stats API", text)
 
-    # --- setup: the Epic sign-in (required), the game, the Stats API -----------------------------------------
+    # --- setup: the Epic sign-in (required), the game, the Stats API, past MMR from tracker.gg -----------------
 
-    SETUP_STEPS = ("epic", "game", "stats", "done")
+    SETUP_STEPS = ("epic", "spare", "game", "stats", "history", "done")
 
     def open_setup(self, step: str = "epic") -> None:
         if not self.live.accounts():
             step = "epic"  # nothing else works before the sign-in
         self._setup = {"step": step, "error": "", "found": None, "statsMsg": "", "statsOk": False,
-                       "seq": (self._setup or {}).get("seq", 0) + 1,
+                       "seq": (self._setup or {}).get("seq", 0) + 1, "importing": False, "imported": "",
                        "forced": bool(self.cfg["app"].get("setup_done")) and not self.live.accounts()}
+
+    def _setup_import(self, _v=None) -> None:
+        """Setup's history step: the Import history panel for the profile just signed in. Setup waits behind
+        it and comes back when the panel closes."""
+        if not self._setup or not self.profile_key:
+            return
+        self._setup["importing"] = True
+        self.open_import(self.profile_key)
 
     def _setup_go(self, step) -> None:
         if not self._setup or step not in self.SETUP_STEPS:
@@ -1884,8 +2283,8 @@ class MainWindow(QMainWindow):
 
     def _setup_view(self) -> dict | None:
         s = self._setup
-        if not s:
-            return None
+        if not s or (s["importing"] and self._imp):
+            return None  # the Import history panel opened from setup is in front
         launch = self.cfg["launch"]
         api = self._stats_api_state()
         found = s["found"]
@@ -1900,8 +2299,8 @@ class MainWindow(QMainWindow):
             "apiOn": api["enabled"], "apiExists": api["exists"], "apiPath": str(stats.stats_ini_path()),
             "apiInstallPath": api.get("install_path", ""),
             "statsMsg": s["statsMsg"], "statsOk": s["statsOk"], "gameRunning": self._rl_running,
-            "profile": (self.current_profile() or {}).get("key", ""),
-            "epic": self._epic_rows(), "privacy": PRIVACY_TEXT,
+            "profile": (self.current_profile() or {}).get("key", ""), "imported": s["imported"],
+            "epic": self._epic_rows(), "privacy": PRIVACY_TEXT, "spare": self._spare_view(),
         }
 
     # --- data ------------------------------------------------------------------
@@ -2000,7 +2399,13 @@ class MainWindow(QMainWindow):
             self._imp_preview = None
 
     def _import_close(self) -> None:
+        imp = self._imp
         self._imp = self._imp_preview = self._imp_payload = None
+        s = self._setup
+        if s and s["importing"]:  # back to setup: on to the end after an import, else where it was
+            s["importing"] = False
+            if imp and imp["step"] == "done":
+                s.update(step="done", imported=imp.get("result") or "")
 
     def export_history(self) -> None:
         profile = self.current_profile()

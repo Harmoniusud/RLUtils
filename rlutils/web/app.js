@@ -5,8 +5,8 @@
 
 let S = null;            // last state from Python
 let bridge = null;
-const U = { screen: "MMR", profileOpen: false, trayOpen: false, ctx: null, modal: null, hover: null };
-const PAGES = ["MMR", "Games", "Play", "Settings"];
+const U = { screen: "MMR", profileOpen: false, trayOpen: false, ctx: null, modal: null, hover: null, hudLive: {} };
+const PAGES = ["MMR", "Games", "Play", "Overlay", "Settings"];
 
 const esc = v => String(v == null ? "" : v).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const attr = v => esc(JSON.stringify(v === undefined ? null : v));
@@ -44,7 +44,7 @@ function render() {
   document.getElementById("apptitle").textContent = S.app.title;
   paint("nav", nav());
   paint("header", header());
-  paint("main", ({ MMR: mmrPage, Games: gamesPage, Play: playPage, Settings: settingsPage })[U.screen]());
+  paint("main", ({ MMR: mmrPage, Games: gamesPage, Play: playPage, Overlay: overlayPage, Settings: settingsPage })[U.screen]());
   paint("footer", footer());
   importer();
   paint("setup", setupPanel() + signinPanel());
@@ -60,7 +60,8 @@ function nav() {
   const grid = '<div style="display:grid;grid-template-columns:7px 7px;gap:2px;"><div style="height:7px;background:currentColor;border-radius:1px;"></div><div style="height:7px;background:currentColor;border-radius:1px;"></div><div style="height:7px;background:currentColor;border-radius:1px;"></div><div style="height:7px;border:1.5px solid currentColor;border-radius:1px;"></div></div>';
   const play = '<div style="width:0;height:0;border-left:13px solid currentColor;border-top:8px solid transparent;border-bottom:8px solid transparent;margin-left:3px;"></div>';
   const gear = '<div style="width:16px;height:16px;border-radius:50%;border:4px dotted currentColor;"></div>';
-  let h = item("MMR", bars) + item("Games", grid) + item("Play", play) + item("Settings", gear) + '<div style="flex:1;"></div>';
+  const layer = '<div style="position:relative;width:20px;height:15px;border:1.5px solid currentColor;border-radius:2px;"><div style="position:absolute;right:2px;top:2px;width:7px;height:5px;background:currentColor;border-radius:1px;"></div></div>';
+  let h = item("MMR", bars) + item("Games", grid) + item("Play", play) + item("Overlay", layer) + item("Settings", gear) + '<div style="flex:1;"></div>';
   h += `<div class="avatar" ${act("toggleProfile")} title="Switch profile">${esc(S.profile ? S.profile.initial : "?")}</div>`;
   if (U.profileOpen) {
     h += `<div id="profiles" class="pop" data-stop="1"><div style="font-size:13px;color:#d0d0d0;font-weight:600;padding:6px 8px;">Profiles</div>`;
@@ -330,6 +331,117 @@ function playPage() {
   return h;
 }
 
+// --- Overlay -----------------------------------------------------------------------------------------
+// Settings of the in-game overlay (rlutils/hud.py) with a preview. While a slider is dragged the page isn't
+// repainted (render waits for mouseup), so its value goes to U.hudLive and only #hudprev is redrawn.
+
+const MOCK_W = 366;  // the preview screen's width in px (.hudside card minus padding)
+
+function hudCfg() { return { ...S.hud.cfg, ...U.hudLive }; }
+
+// The overlay as HTML, at k times its real size: the same sizes hud.HudWindow draws with.
+function hudBox(v, c, k) {
+  const s = c.scale / 100 * k, px = n => (n * s).toFixed(2) + "px";
+  const bg = `rgba(18,18,20,${(c.bg / 100).toFixed(2)})`, sh = `0 ${px(1)} 0 rgba(0,0,0,.66)`;
+  let h = `<div style="position:absolute;left:0;top:0;bottom:0;width:${px(3)};background:#B65CF2;"></div>`;
+  const title = v.title ? `<div style="font:600 ${px(12)} var(--ft);color:#d9adff;text-shadow:${sh};margin-bottom:${px(4)};">${esc(v.title)}</div>` : "";
+  const lbl = t => `<span style="font:400 ${px(12)} var(--ft);color:#a8a8a8;text-shadow:${sh};">${esc(t)}</span>`;
+  const val = (t, color, big) => `<span class="fig" style="font-size:${px(big ? 30 : 17)};line-height:1.2;color:${color};text-shadow:${sh};">${esc(t)}</span>`;
+  if (c.layout === "horizontal") {
+    h += title + `<div style="display:flex;gap:${px(18)};align-items:flex-end;">` + v.items.map(it =>
+      `<div style="display:flex;flex-direction:column;">${val(it.value, it.color, it.big)}${lbl(it.label.toUpperCase())}</div>`).join("") + `</div>`;
+  } else {
+    h += title + `<div style="display:flex;flex-direction:column;gap:${px(4)};min-width:${px(120)};">` + v.items.map(it => it.big
+      ? `<div style="display:flex;align-items:baseline;gap:${px(8)};">${val(it.value, it.color, true)}${lbl(it.label)}</div>`
+      : `<div style="display:flex;align-items:center;gap:${px(20)};">${lbl(it.label.toUpperCase())}<span style="flex:1;"></span>${val(it.value, it.color)}</div>`).join("") + `</div>`;
+  }
+  if (!v.title && !v.items.length) h += `<div style="font:400 ${px(12)} var(--ft);color:#a8a8a8;">Nothing turned on</div>`;
+  return { html: h, style: `background:${bg};opacity:${c.opacity / 100};padding:${px(12)} ${px(12)} ${px(12)} ${px(15)};border-radius:${px(8)};` };
+}
+
+function hudPreview() {
+  const H = S.hud, c = hudCfg(), [sw, sh] = H.screenSize, f = MOCK_W / sw;
+  const box = hudBox(H.preview, c, f), real = hudBox(H.preview, c, 1);
+  const col = c.anchor[1], row = c.anchor[0], tf = [];
+  let pos = "";
+  pos += col === "l" ? `left:${c.dx * f}px;` : col === "r" ? `right:${c.dx * f}px;` : (tf.push("translateX(-50%)"), `left:calc(50% + ${c.dx * f}px);`);
+  pos += row === "t" ? `top:${c.dy * f}px;` : row === "b" ? `bottom:${c.dy * f}px;` : (tf.push("translateY(-50%)"), `top:calc(50% + ${c.dy * f}px);`);
+  return `<div class="lbl">Preview · ${esc(H.pidLabel)}</div>
+    <div class="mock" style="width:${MOCK_W}px;height:${(MOCK_W * sh / sw).toFixed(0)}px;"><div class="goal"></div><div class="ball"></div>
+      <div class="hudbox" style="${pos}${tf.length ? `transform:${tf.join(" ")};` : ""}${box.style}">${box.html}</div>
+      ${c.enabled ? "" : `<div class="off" style="align-items:flex-end;padding-bottom:8px;">Overlay is off</div>`}</div>
+    <div style="font-size:11px;color:#7d7d7d;margin-top:-4px;">Where it sits on a ${sw}×${sh} screen. Actual size:</div>
+    <div class="actual"><div class="hudbox" style="${real.style}">${real.html}</div></div>`;
+}
+
+function hudSlider(key, label, min, max, value, unit, title) {
+  return `<div class="sl" title="${esc(title || "")}"><div class="h"><span>${esc(label)}</span><span id="hv-${key}">${value}${unit}</span></div>
+    <input type="range" data-hud="${key}" data-unit="${unit}" min="${min}" max="${max}" value="${value}"></div>`;
+}
+
+function hudSeg(key, options, cur, wrap) {
+  return `<div class="seg sm${wrap ? " wrap" : ""}">` + options.map(o => `<div class="${o.id === cur ? "on" : ""}" ${act("hudSet", { key, value: o.id })}${o.title ? ` title="${esc(o.title)}"` : ""}>${esc(o.label)}</div>`).join("") + "</div>";
+}
+
+function hudToggleRow(key, label, sub, on, last) {
+  return `<div class="hrow" style="padding:12px 0;${last ? "" : "border-bottom:1px solid #2d2d2d;"}"><div class="k"><div>${esc(label)}</div><div>${esc(sub)}</div></div><div class="toggle${on ? " on" : ""}" ${act("hudToggle", key)}><div></div></div></div>`;
+}
+
+function overlayPage() {
+  const H = S.hud, c = H.cfg, st = H.status, ses = H.session;
+  const anchors = ["tl", "tc", "tr", "ml", "mc", "mr", "bl", "bc", "br"];
+  const names = { t: "Top", m: "Middle", b: "Bottom", l: "left", c: "centre", r: "right" };
+  let h = `<div class="col">
+    <div class="row" style="gap:16px;"><h1>Overlay</h1><div class="flex1"></div>
+      <div class="apipill" style="background:#1c1c1c;border:1px solid #333333;"><div class="dot" style="background:${st.color}"></div><span class="d" style="color:#d6d6d6;">${esc(st.text)}</span></div></div>
+    <div class="hudgrid"><div class="col">
+      <div class="card hcard">
+        <div class="hrow"><div class="k"><div>In-game overlay</div><div>Your MMR, the session's MMR change and record on top of Rocket League</div></div><div class="toggle${c.enabled ? " on" : ""}" ${act("hudToggle", "enabled")}><div></div></div></div>
+        <div class="row" style="gap:8px;flex-wrap:wrap;"><div class="btn" ${act("hudPreview")} title="Shows it on screen for 10 seconds, wherever you are">Show on screen</div>
+          <div class="btn" ${act("hudReset")} title="Start a new session now: earlier games stop counting">Reset session</div>
+          ${ses.reset ? `<div class="btn" ${act("hudReset", "clear")}>Undo reset</div>` : ""}</div>
+        <div style="font-size:11px;color:#7d7d7d;line-height:1.5;">Set Rocket League to <b>Borderless</b> or <b>Windowed</b> (Settings › Video › Display Mode): nothing can draw over exclusive Fullscreen. It's a separate click-through window; nothing touches the game. <b>Ctrl+Shift+O</b> hides and shows it in game.</div>
+      </div>
+      <div class="card hcard">
+        <div class="row" style="justify-content:space-between;gap:12px;flex-wrap:wrap;"><div class="lbl">What it shows</div>${hudSeg("playlist", H.playlists, c.playlist, true)}</div>
+        <div style="font-size:11px;color:#7d7d7d;margin-top:-4px;">Auto follows the ranked playlist you're playing (else the last one you played).</div>
+        <div class="shows">${H.items.map(it => `<div class="show${it.on ? " on" : ""}" ${act("hudToggle", "show." + it.id)}><div class="box">${it.on ? "✓" : ""}</div><div style="min-width:0;"><div class="t">${esc(it.label)}</div><div class="d">${esc(it.sub)}</div></div></div>`).join("")}</div>
+      </div>
+      <div class="card hcard">
+        <div class="lbl">Position</div>
+        <div class="row" style="gap:20px;align-items:flex-start;">
+          <div class="anchors">${anchors.map(a => `<div class="${c.anchor === a ? "on" : ""}" ${act("hudSet", { key: "anchor", value: a })} title="${names[a[0]]} ${names[a[1]]}"></div>`).join("")}</div>
+          <div style="flex:1;min-width:0;display:flex;flex-direction:column;gap:12px;">
+            <div class="segl"><span>Screen</span>${hudSeg("screen", H.screens, c.screen)}</div>
+            <div class="sl2">${hudSlider("dx", "Distance from the side", 0, 800, c.dx, " px", "Pixels in from the left or right edge (from the centre for centred positions)")}${hudSlider("dy", "Distance from the top / bottom", 0, 800, c.dy, " px")}</div>
+          </div>
+        </div>
+      </div>
+      <div class="card hcard">
+        <div class="row" style="justify-content:space-between;"><div class="lbl">Look</div>${hudSeg("layout", [{ id: "vertical", label: "Vertical" }, { id: "horizontal", label: "Horizontal" }], c.layout)}</div>
+        <div class="sl2">${hudSlider("scale", "Size", 50, 250, c.scale, "%")}${hudSlider("opacity", "Opacity", 20, 100, c.opacity, "%", "The whole overlay, text included")}
+          ${hudSlider("bg", "Background", 0, 100, c.bg, "%", "The dark panel behind the text; 0 = text only")}</div>
+      </div>
+      <div class="card hcard" style="gap:0;padding-top:8px;padding-bottom:8px;">
+        <div class="hrow" style="padding:10px 0;border-bottom:1px solid #2d2d2d;"><div class="k"><div>Show it</div><div>When the overlay is on screen</div></div>${hudSeg("when", [{ id: "front", label: "Game in front" }, { id: "running", label: "Game running" }, { id: "always", label: "Always" }], c.when)}</div>
+        ${hudToggleRow("hotkey", "Ctrl+Shift+O hides and shows it", "A Windows hotkey (works in game; the key press still reaches the game)", c.hotkey)}
+        ${hudToggleRow("hide_capture", "Leave it out of recordings and screenshots", "OBS display capture, Discord screen share, Snipping Tool. Game capture never shows it anyway", c.hide_capture)}
+        <div style="padding:12px 0 6px;">${hudSlider("gap", "A break this long ends the session", 10, 180, ses.gap, " min")}</div>
+      </div>
+    </div>
+    <div class="hudside">
+      <div class="card hcard" id="hudprev">${hudPreview()}</div>
+      <div class="card hcard">
+        <div class="row" style="justify-content:space-between;gap:12px;"><div class="lbl">This session</div><div style="font-size:11px;color:#7d7d7d;text-align:right;">${esc(ses.title)}</div></div>
+        <div style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;">${ses.stats.map(([l, v, col]) => `<div style="background:#202020;border:1px solid #333333;border-radius:7px;padding:8px 10px;"><div class="sub">${esc(l)}</div><div style="font:600 20px var(--fd);color:${col};">${esc(v)}</div></div>`).join("")}</div>
+        ${ses.per.length ? `<div class="mtable" style="font-size:11px;color:#7d7d7d;font-weight:600;grid-template-columns:minmax(0,1fr) 80px 60px;"><div>Playlist</div><div>Record</div><div>MMR</div></div>` + ses.per.map(p => `<div class="mtable" style="grid-template-columns:minmax(0,1fr) 80px 60px;font:500 13px var(--ft);padding:4px 0;border-top:1px solid #2d2d2d;"><div style="font-weight:600;">${esc(p.name)}</div><div>${esc(p.wl)}</div><div style="color:${p.color};font-weight:600;">${esc(p.delta)}</div></div>`).join("") : `<div class="empty" style="font-size:12px;">Games show up here as you play them (saved from the Stats API).</div>`}
+        ${ses.reset ? `<div style="font-size:11px;color:#7d7d7d;">${esc(ses.reset)}</div>` : ""}
+      </div>
+    </div></div>
+  </div>`;
+  return h;
+}
+
 // --- Settings ----------------------------------------------------------------------------------------
 
 function settingsPage() {
@@ -365,6 +477,7 @@ function settingsPage() {
   h += `<div class="row" style="gap:8px;flex-wrap:wrap;"><div class="btn${T.epic.length ? "" : " primary"}" ${act("epicLogin")}>${T.epic.length ? "Sign in another account" : "Sign in with Epic"}</div></div>
       <div style="font-size:11px;color:#7d7d7d;line-height:1.5;">${esc(T.privacy)}</div>
     </div>
+    ${spareCard(T.spare)}
     <div class="card" style="padding:16px;display:flex;flex-direction:column;gap:12px;">
       <div class="lbl">Account switcher (optional)</div>`;
   for (const p of T.paths) h += `<div style="display:grid;grid-template-columns:160px minmax(0,1fr) auto;gap:10px 16px;align-items:center;font-size:13px;"><div style="color:#a8a8a8;">${esc(p.label)}</div><input class="field" id="path-${p.key}" data-path="${p.key}" value="${esc(p.value)}" placeholder="${esc(p.placeholder)}" spellcheck="false" title="${esc(p.value || p.placeholder)}"><div class="btn" ${act("browse", p.key)}>Browse</div></div>`;
@@ -378,6 +491,26 @@ function settingsPage() {
     <div style="font-size:11px;color:#7d7d7d;line-height:1.5;">${esc(S.app.title)} ${esc(S.app.version)} · Not affiliated with Psyonix, Epic Games or Tracker Network. Rocket League is a trademark of Psyonix LLC. Reads your MMR from Rocket League's servers (after your Epic sign-in) through the same unofficial API the game uses (github.com/dank/rlapi), and games from the game's local Stats API. The game itself is never touched.</div>
   </div>`;
   return h;
+}
+
+// A spare Epic account reads MMR while the game runs, so the game's own sign-in is never dropped.
+function spareCard(P) {
+  const line = (color, text) => `<div style="display:flex;gap:10px;font-size:13px;line-height:1.5;color:#d6d6d6;"><div style="width:7px;height:7px;border-radius:50%;background:${color};margin-top:7px;flex:none;"></div><div>${esc(text)}</div></div>`;
+  let h = `<div class="card" style="padding:16px;display:flex;flex-direction:column;gap:12px;">
+    <div class="row" style="justify-content:space-between;"><div class="lbl">Spare account (optional)</div>
+      <div class="tag" style="${P.on ? "background:rgba(108,203,95,.15);color:var(--win);" : ""}">${P.on ? "ON" : "NOT ADDED"}</div></div>
+    <div style="font-size:13px;color:#a8a8a8;line-height:1.5;">${esc(P.why)}</div>
+    ${line(P.on ? "#5a5a5a" : "#fce100", P.without)}
+    ${line(P.on ? "#6ccb5f" : "#5a5a5a", P.with)}`;
+  if (P.on) {
+    h += `<div style="display:flex;align-items:center;gap:12px;font-size:13px;"><div style="flex:1;min-width:0;"><b>${esc(P.name)}</b> <span style="color:#7d7d7d;">${esc(P.id)}</span>
+        <div style="font-size:12px;color:${P.stateColor};margin-top:2px;user-select:text;">${esc(P.state)}</div></div>
+        <div class="btn" ${act("spareLogin")} title="Sign in with another spare account">Change</div><div class="btn danger" ${act("spareRemove")}>Remove</div></div>`;
+  } else {
+    h += `<div style="font-size:11px;color:#7d7d7d;line-height:1.5;">${esc(P.how)}</div>
+      <div class="row"><div class="btn" ${act("spareLogin")}>Add spare account</div></div>`;
+  }
+  return h + `</div>`;
 }
 
 // --- Import history (one-time paste from tracker.gg) ------------------------------------------------
@@ -436,7 +569,7 @@ function importBody(I) {
     if (!p.new) h += `<div class="note info">Nothing new to import: everything in it is already stored.</div>`;
   } else {
     h += `<div class="note info">${esc(I.result)}</div>
-      <div class="dim" style="font-size:13px;line-height:1.5;">From now on, new MMR comes from Rocket League's log each time you queue ranked. There's no need to import again.</div>`;
+      <div class="dim" style="font-size:13px;line-height:1.5;">From now on, new MMR comes from Rocket League's servers on its own. There's no need to import again.</div>`;
   }
   return h;
 }
@@ -449,7 +582,8 @@ function importButtons(I) {
 }
 
 // --- Setup (first start; Settings > Run setup again) -------------------------------------------------
-// Steps: the Epic sign-in (required: MMR comes from it), how Play starts the game, Rocket League's Stats API.
+// Steps: the Epic sign-in (required: MMR comes from it), how Play starts the game, Rocket League's Stats API,
+// past MMR from tracker.gg (opens the Import history panel; setup waits behind it).
 
 function setupPanel() {
   const T = S.setup;
@@ -463,11 +597,25 @@ function setupPanel() {
       <div class="lead">${esc(S.app.title)} tracks your MMR for every ranked playlist (1v1, 2v2, 3v3, 4v4 and the extra modes) straight from Rocket League's servers. For that it needs you to sign in to Epic once: your browser opens Epic's sign-in page, and you won't be asked again.</div>
       <div class="note info" style="line-height:1.5;">${esc(T.privacy)}</div>`;
     if (T.epic.length) h += `<div class="steps">${T.epic.map(a => `<div class="step"><div class="num ok">✓</div><div>Signed in as <b>${esc(a.name)}</b></div></div>`).join("")}</div>`;
-    h += `<div class="sub" style="line-height:1.5;">Uses the same unofficial API as Rocket League itself (github.com/dank/rlapi); not made or endorsed by Psyonix or Epic. It isn't used while Rocket League runs, so a session's MMR shows when you close the game.</div>
+    h += `<div class="sub" style="line-height:1.5;">Uses the same unofficial API as Rocket League itself (github.com/dank/rlapi); not made or endorsed by Psyonix or Epic. Your MMR is read right after each ranked match ends.</div>
       ${err}
       <div class="ibtns">` + (T.epic.length
-        ? `<div class="btn" ${act("epicLogin")}>Add another account</div><div class="btn primary" ${act("setupGo", "game")}>Next</div>`
+        ? `<div class="btn" ${act("epicLogin")}>Add another account</div><div class="btn primary" ${act("setupGo", "spare")}>Next</div>`
         : `<div class="btn primary" ${act("epicLogin")}>Sign in with Epic</div>`) + `</div>`;
+  } else if (T.step === "spare") {
+    const P = T.spare;
+    h += `<div class="mt">Add a spare Epic account? <span style="font:600 12px var(--ft);color:#a8a8a8;vertical-align:middle;margin-left:6px;">Optional, recommended</span></div>
+      <div class="lead">${esc(P.why)}</div>
+      <div class="steps">
+        <div class="step"><div class="num" style="background:#373737;color:#a8a8a8;">–</div><div>${esc(P.without)}</div></div>
+        <div class="step"><div class="num ok">+</div><div>${esc(P.with)}</div></div>
+      </div>`;
+    h += P.on
+      ? `<div class="note info">Spare account added: <b>${esc(P.name)}</b>. Your game won't be disconnected by MMR reads.</div>`
+      : `<div class="sub" style="line-height:1.5;">${esc(P.how)} You can add it later too: Settings › Spare account.</div>`;
+    h += `${err}<div class="ibtns"><div class="btn" ${act("setupGo", "epic")}>Back</div>` + (P.on
+      ? `<div class="btn primary" ${act("setupGo", "game")}>Next</div>`
+      : `<div class="btn" ${act("setupGo", "game")}>Skip</div><div class="btn primary" ${act("spareLogin")}>Add spare account</div>`) + `</div>`;
   } else if (T.step === "game") {
     h += `<div class="mt">How should Play start Rocket League?</div>
       <div class="lead">Right now: through <b>${esc(T.launch)}</b>.</div>
@@ -478,7 +626,7 @@ function setupPanel() {
       h += `<div class="opt on"><div class="radio"><div></div></div><div style="flex:1;min-width:0;"><div style="font-weight:600;">Your choice</div><div class="sub" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="${esc(T.shortcut)}">${esc(T.shortcut)}</div></div></div>`;
     h += `<div class="sub" style="line-height:1.5;">An Epic install starts through the Epic Games launcher, which signs the game in. A shortcut can be anything that starts the game, for example a Steam shortcut you made for it.</div>
       ${err}
-      <div class="ibtns"><div class="btn" ${act("setupGo", "epic")}>Back</div><div class="btn primary" ${act("setupGo", "stats")}>Next</div></div>`;
+      <div class="ibtns"><div class="btn" ${act("setupGo", "spare")}>Back</div><div class="btn primary" ${act("setupGo", "stats")}>Next</div></div>`;
   } else if (T.step === "stats") {
     h += `<div class="mt">Turn on Rocket League's Stats API?</div>
       <div class="lead">The Stats API is the game's official data feed for programs on this PC. A lot of this app needs it:
@@ -491,15 +639,28 @@ function setupPanel() {
       if (T.statsMsg) h += `<div class="note ${T.statsOk ? "info" : "err"}">${esc(T.statsMsg)}</div>`;
     }
     h += `<div class="ibtns"><div class="btn" ${act("setupGo", "game")}>Back</div>` + (T.apiOn
-      ? `<div class="btn primary" ${act("setupGo", "done")}>Next</div>`
-      : `<div class="btn" ${act("setupGo", "done")}>Not now</div><div class="btn primary${T.gameRunning ? " dis" : ""}" ${act("enableStats")}>Enable Stats API</div>`) + `</div>`;
+      ? `<div class="btn primary" ${act("setupGo", "history")}>Next</div>`
+      : `<div class="btn" ${act("setupGo", "history")}>Not now</div><div class="btn primary${T.gameRunning ? " dis" : ""}" ${act("enableStats")}>Enable Stats API</div>`) + `</div>`;
+  } else if (T.step === "history") {
+    h += `<div class="mt">Bring in your past MMR?</div>
+      <div class="lead">Rocket League's servers only give ${esc(S.app.title)} your MMR as it is now, so your charts would start today.
+        Your earlier MMR can be imported once from tracker.gg, so they show your past seasons too.</div>
+      <div class="steps">
+        <div class="step"><div class="num" style="background:#373737;color:#a8a8a8;">i</div><div class="dim">It takes two copy-and-pastes from tracker.gg pages that open in your browser; the next window walks you through them. Nothing is saved until you check the preview and click Import.</div></div>
+      </div>
+      <div class="sub" style="line-height:1.5;">You can also do it later: Play page > Import history.</div>
+      <div class="ibtns"><div class="btn" ${act("setupGo", "stats")}>Back</div><div class="btn" ${act("setupGo", "done")}>Not now</div><div class="btn primary" ${act("setupImport")}>Import history</div></div>`;
   } else {
     h += `<div class="mt">You're set</div>
       <div class="steps">
         <div class="step"><div class="num ok">✓</div><div>Signed in to Epic as <b>${T.epic.map(a => esc(a.name)).join(", ")}</b></div></div>
+        <div class="step"><div class="num${T.spare.on ? " ok" : ""}">${T.spare.on ? "✓" : "–"}</div><div>${T.spare.on
+          ? `Spare account <b>${esc(T.spare.name)}</b>: MMR is read through it while you play, as each match starts and ends`
+          : "No spare account: with the game open, MMR is read right after each match ends. Add one any time in Settings › Spare account"}</div></div>
         <div class="step"><div class="num ok">✓</div><div>Play starts Rocket League through <b>${esc(T.launch)}</b></div></div>
         <div class="step"><div class="num${T.apiOn ? " ok" : ""}">${T.apiOn ? "✓" : "!"}</div><div>Stats API: ${T.apiOn ? "on" : "off. Turn it on any time in Settings > Rocket League"}</div></div>
-        <div class="step"><div class="num" style="background:#373737;color:#a8a8a8;">i</div><div class="dim">Your MMR comes from Rocket League's servers: when the app starts, when you close the game and every 30 minutes. Past MMR can be imported once from tracker.gg: Play page > Import history.</div></div>
+        ${T.imported ? `<div class="step"><div class="num ok">✓</div><div>Past MMR: ${esc(T.imported)}</div></div>` : ""}
+        <div class="step"><div class="num" style="background:#373737;color:#a8a8a8;">i</div><div class="dim">Your MMR comes from Rocket League's servers: when the app starts, right after each ranked match ends, and every 30 minutes while the game is closed.${T.imported ? "" : " Past MMR can be imported once from tracker.gg: Play page > Import history."}</div></div>
       </div>
       <div class="ibtns"><div class="btn primary" ${act("setupFinish")}>Finish</div></div>`;
   }
@@ -510,7 +671,8 @@ function signinPanel() {
   const G = S.signin;
   if (!G) return "";
   let h = `<div class="wizbg" style="z-index:60;"><div class="pop wiz" data-stop="1" style="width:520px;">
-    <div class="mt">Sign in to Epic in your browser</div>`;
+    <div class="mt">${G.spare ? "Sign in your spare Epic account" : "Sign in to Epic in your browser"}</div>`;
+  if (G.spare) h += `<div class="note warn" style="line-height:1.5;">Sign in with the <b>spare</b> account, not the one you play on. If Epic's page shows you already signed in as your main account, sign out there first (or copy the link into a private window).</div>`;
   if (G.state === "starting") h += `<div class="lead">Opening Epic's sign-in page…</div>`;
   else if (G.state === "error") h += `<div class="note err">${esc(G.error)}</div>`;
   else h += `<div class="lead">Your browser opened Epic's sign-in page. Sign in there (with your password, 2FA or a security check if Epic asks), then confirm this code:</div>
@@ -636,9 +798,16 @@ document.addEventListener("mouseleave", () => { if (U.hover != null) { U.hover =
 
 document.addEventListener("input", e => {
   if (e.target.id === "vib") document.getElementById("vibval").textContent = e.target.value + "%";
+  const k = e.target.dataset.hud;
+  if (k) {  // live: the label, the preview and the overlay itself follow the slider (saved on change)
+    document.getElementById("hv-" + k).textContent = e.target.value + e.target.dataset.unit;
+    if (k !== "gap") { U.hudLive[k] = +e.target.value; const p = document.getElementById("hudprev"); if (p) p.innerHTML = hudPreview(); }
+    call("hudSet", { key: k, value: +e.target.value, save: false });
+  }
 });
 document.addEventListener("change", e => {
   if (e.target.id === "vib") call("setVibrance", +e.target.value);
+  if (e.target.dataset.hud) { delete U.hudLive[e.target.dataset.hud]; call("hudSet", { key: e.target.dataset.hud, value: +e.target.value }); }
   if (e.target.dataset.path) call("setPath", { key: e.target.dataset.path, value: e.target.value });
 });
 
@@ -657,7 +826,7 @@ document.addEventListener("keydown", e => {
     if (i >= 0) { LOCAL.modal(i); render(); }
     return;
   }
-  if (e.ctrlKey && !e.altKey && "1234".includes(e.key)) { e.preventDefault(); LOCAL.go(PAGES[+e.key - 1]); closePopups(); render(); }
+  if (e.ctrlKey && !e.altKey && "12345".includes(e.key)) { e.preventDefault(); LOCAL.go(PAGES[+e.key - 1]); closePopups(); render(); }
   if (e.ctrlKey && ["r", "R", "F5"].includes(e.key) || e.key === "F5") e.preventDefault();
 });
 

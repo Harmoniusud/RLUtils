@@ -278,18 +278,115 @@ def session_positions(games: list[dict], gap: timedelta) -> dict[int, int]:
     return pos
 
 
-def current_session(games: list[dict], gap: timedelta, now: datetime) -> tuple[int, timedelta]:
-    """(games, length) of the session going on now: the latest run of games, if its last one ended within
-    `gap` of now (else (0, 0))."""
-    ordered = sorted(games, key=lambda g: g["ended_at"], reverse=True)
+def session_games(games: list[dict], gap: timedelta, now: datetime, since: datetime | None = None) -> list[dict]:
+    """The games of the session going on now, oldest first: the latest run of games, if its last one ended
+    within `gap` of now (else none). since: Reset session; games that ended before it don't count."""
+    ordered = sorted((g for g in games if since is None or _dt(g["ended_at"]) >= since),
+                     key=lambda g: g["ended_at"], reverse=True)
     if not ordered or now - _dt(ordered[0]["ended_at"]) > gap:
-        return 0, timedelta(0)
+        return []
     run = [ordered[0]]
     for g in ordered[1:]:
         if _dt(run[-1]["started_at"] or run[-1]["ended_at"]) - _dt(g["ended_at"]) > gap:
             break
         run.append(g)
-    return len(run), _dt(ordered[0]["ended_at"]) - _dt(run[-1]["started_at"] or run[-1]["ended_at"])
+    return run[::-1]
+
+
+def _start(game: dict) -> datetime:
+    return _dt(game["started_at"] or game["ended_at"])
+
+
+def current_session(games: list[dict], gap: timedelta, now: datetime) -> tuple[int, timedelta]:
+    """(games, length) of the session going on now: the latest run of games, if its last one ended within
+    `gap` of now (else (0, 0))."""
+    run = session_games(games, gap, now)
+    if not run:
+        return 0, timedelta(0)
+    return len(run), _dt(run[-1]["ended_at"]) - _start(run[0])
+
+
+def duration(length: timedelta) -> str:
+    """'1h 05m', '24m'."""
+    mins = max(0, int(length.total_seconds() // 60))
+    return f"{mins // 60}h {mins % 60:02d}m" if mins >= 60 else f"{mins}m"
+
+
+def session_delta(rows: list[tuple[datetime, dict]], start: datetime | None) -> int | None:
+    """MMR change of one playlist since `start`: the newest reading minus the last one at or before it (or,
+    with none before it, the first one after it). None without readings."""
+    if not rows:
+        return None
+    if start is None:
+        return 0
+    base = next((r["rating"] for t, r in reversed(rows) if t <= start), rows[0][1]["rating"])
+    return rows[-1][1]["rating"] - base
+
+
+def streak(games: list[dict]) -> tuple[str, str]:
+    """('W3', colour) for the newest run of wins or losses in `games` (oldest first); ('—', muted) for none."""
+    if not games:
+        return "—", MUTED
+    last = bool(games[-1]["won"])
+    n = 0
+    for g in reversed(games):
+        if bool(g["won"]) != last:
+            break
+        n += 1
+    return f"{'W' if last else 'L'}{n}", WIN if last else LOSS
+
+
+# The overlay's lines (Overlay page toggles), in the order they show.
+HUD_ITEMS = [
+    ("header", "Playlist & rank", "The playlist and your rank in it, as a title"),
+    ("mmr", "MMR", "Your MMR in the playlist now"),
+    ("delta", "Session +/−", "How much MMR the session won or lost in this playlist"),
+    ("record", "Session record", "Wins and losses this session (every playlist)"),
+    ("streak", "Streak", "Wins or losses in a row"),
+    ("winrate", "Win rate", "Share of this session's games won"),
+    ("games", "Games", "Games played this session"),
+    ("length", "Session time", "Time since the session's first game started"),
+    ("next", "Next rank", "MMR to the next division"),
+    ("match", "Live match", "Score and clock of the match being played (only during one)"),
+]
+
+
+def hud(games: list[dict], rows: list[tuple[datetime, dict]], pid: int, table: list | None, dist,
+        gap: timedelta, now: datetime, since: datetime | None, live: dict | None, show: dict) -> dict:
+    """What the overlay shows: a title and the lines turned on in `show`. games: the profile's saved games;
+    rows: (time, reading) of playlist `pid`, oldest first; dist: data.tier_distance for its last reading;
+    since: Reset session; live: the Stats API's match going on (stats.GameFeed.live), if any."""
+    run = session_games(games, gap, now, since)
+    start = _start(run[0]) if run else None
+    last = rows[-1][1] if rows else None
+    tier, div = rank_of(last, table) if last else (None, None)
+    wins = sum(1 for g in run if g["won"])
+    delta = session_delta(rows, start)
+    title = short(pid) + (f" · {rank_text(tier, div)}" if last and tier is not None else "")
+    lines: dict[str, dict] = {
+        "mmr": {"label": "MMR", "value": str(last["rating"]) if last else "—", "color": TEXT, "big": True},
+        "delta": {"label": "Session", "value": sign(delta or 0), "color": WIN if (delta or 0) > 0
+                  else LOSS if (delta or 0) < 0 else MUTED},
+        "record": {"label": "Record", "value": f"{wins}W – {len(run) - wins}L", "color": TEXT},
+        "winrate": {"label": "Win rate", "value": pct(wins, len(run)),
+                    "color": MUTED if not run else WIN if wins * 2 >= len(run) else LOSS},
+        "games": {"label": "Games", "value": str(len(run)), "color": TEXT},
+        "length": {"label": "Time", "value": duration(now - start) if start else "—", "color": TEXT},
+    }
+    lines["streak"] = dict(zip(("value", "color"), streak(run)), label="Streak")
+    nxt = gauge(last["rating"], tier, div, dist)["toNext"] if last else ""
+    lines["next"] = {"label": "Next", "value": nxt.replace(" MMR to ", " to ") or "—", "color": "#d5c6ff"}
+    if live and live.get("playlist") is not None:
+        sc, mine = live.get("scores") or {}, live.get("my_team")
+        score = (f"{sc.get(0, 0)}–{sc.get(1, 0)}" if mine is None else f"{sc.get(mine, 0)}–{sc.get(1 - mine, 0)}")
+        t = live.get("time_left")
+        clock = " OT" if live.get("overtime") else "" if t is None else f" · {t // 60}:{t % 60:02d}"
+        ahead = 0 if mine is None else sc.get(mine, 0) - sc.get(1 - mine, 0)
+        lines["match"] = {"label": "Match", "value": score + clock,
+                          "color": WIN if ahead > 0 else LOSS if ahead < 0 else TEXT}
+    items = [dict(lines[k], id=k) for k, _label, _sub in HUD_ITEMS if k != "header" and show.get(k) and k in lines]
+    return {"title": title if show.get("header") else "", "items": items, "pid": pid,
+            "session": {"games": len(run), "wins": wins, "start": start, "delta": delta}}
 
 
 def _mvp(game: dict) -> dict | None:

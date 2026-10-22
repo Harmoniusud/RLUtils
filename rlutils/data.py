@@ -75,7 +75,9 @@ DEFAULTS = {
     # in the data folder, encrypted for this Windows user). `asked`: switcher accounts already offered sign-in.
     "psynet": {
         "every_min": 30,
+        "after_game_s": 0,    # seconds after a ranked match ends before reading (never during a match: DuplicateLogin)
         "asked": [],
+        "spare": "",          # a spare Epic account (signed in here, not tracked) that reads while the game runs
     },
     # Play: switch the Epic launcher to the picked account (when accounts are saved), then start Rocket League.
     # `method`: "auto" (Epic if installed there, else Steam; found at each start), "epic", "steam", or "path"
@@ -118,7 +120,31 @@ DEFAULTS = {
         "check_updates": True,          # ask GitHub for the newest release at start and once a day
         "skip_version": "",             # a release the user dismissed: not shown again
     },
-    # Matches more than this many minutes apart count as separate sessions (older data only).
+    # The in-game overlay (rlutils/hud.py, Overlay page): a click-through, always-on-top window over Rocket League
+    # (Borderless or Windowed). `show`: which lines it has. `playlist`: "auto" (the match's, else the last one
+    # played) or a playlist id. `anchor`: t/m/b + l/c/r corner of the screen, `dx`/`dy` pixels in from it.
+    # `screen`: "auto" (Rocket League's monitor) or a screen name. `when`: "front" (Rocket League in front),
+    # "running" or "always". `session_since`: Reset session (ISO time; games before it don't count).
+    # (Not under "overlay": that key holds the profile and playlist shown, and its old overlay keys are dropped.)
+    "hud": {
+        "enabled": False,
+        "show": {"header": True, "mmr": True, "delta": True, "record": True, "streak": True, "winrate": False,
+                 "games": False, "length": False, "next": False, "match": False},
+        "playlist": "auto",
+        "anchor": "tr",
+        "dx": 24,
+        "dy": 140,
+        "screen": "auto",
+        "scale": 100,
+        "opacity": 95,
+        "bg": 80,
+        "layout": "vertical",
+        "when": "front",
+        "hotkey": True,
+        "hide_capture": False,
+        "session_since": "",
+    },
+    # Games more than this many minutes apart count as separate sessions (status bar, overlay).
     "session_gap_min": 30,
 }
 

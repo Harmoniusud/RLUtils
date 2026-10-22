@@ -17,8 +17,11 @@ Nothing is sent anywhere else. Requests are signed with PsySig (HMAC-SHA256 with
 game version / feature set / build secret change with game updates: when PsyNet refuses them, the current
 values are read from rlapi's psynet.go on GitHub (data only, parsed with a regex) and kept in psynet_version.json.
 
-A fetch signs into PsyNet as the player, like the game does, so it is never done while Rocket League runs
-(the game's own session could be dropped): the caller checks that.
+A fetch signs into PsyNet as the player, like the game does. The caller (PsyNetWatcher in app.py) does it
+beside the running game only right after a ranked match ends, and logs what the game does after each such
+read (psynet.log): a read during a match dropped the game's own connection (DuplicateLogin) and lagged it.
+With a spare Epic account signed in, reads beside the game sign in as the spare and ask for the player's
+skills by id (fetch_skills(spare=...)), which leaves the game's session alone; then it also reads as matches start.
 """
 from __future__ import annotations
 
@@ -420,21 +423,36 @@ class Fetch:
     at: datetime
 
 
-def fetch_skills(store: LoginStore, account: str, version: Version) -> Fetch:
+class SpareRefused(PsyNetError):
+    """The spare account signed in, but PsyNet gave it no skills for the player asked about."""
+
+
+def fetch_skills(store: LoginStore, account: str, version: Version, spare: str | None = None) -> Fetch:
     """Sign in with the saved device auth, then read the player's skills from PsyNet. LoginExpired when the
-    saved sign-in no longer works."""
-    tok = _signed_in_token(store, account)
-    name = tok.get("displayName") or store.load().get(account.lower(), {}).get("name", "")
+    saved sign-in no longer works.
+
+    spare: sign in as this other saved account instead and ask for `account`'s skills by its PlayerID. The
+    player's own PsyNet session (the running game's) is then left alone: a second sign-in as the same player
+    closes the game's connection (DuplicateLogin). LoginExpired then means the spare's sign-in."""
+    reader = spare or account
+    tok = _signed_in_token(store, reader)
+    stored = store.load()
+    reader_name = tok.get("displayName") or stored.get(reader.lower(), {}).get("name", "")
     eos = _eos_token(_exchange_code(tok["access_token"]))
     try:
-        auth = _auth_player(eos, name, version.v)
+        auth = _auth_player(eos, reader_name, version.v)
     except PsyNetError:
         if not version.update_from_rlapi():
             raise
         eos = _eos_token(_exchange_code(tok["access_token"]))  # the EOS token may be single use: get another
-        auth = _auth_player(eos, name, version.v)
-    result = _ws_call(auth, version.v, "Skills/GetPlayerSkill v1", {"PlayerID": f"Epic|{eos['account_id']}|0"})
-    return Fetch(eos["account_id"].lower(), name, parse_skills(result), datetime.now(timezone.utc))
+        auth = _auth_player(eos, reader_name, version.v)
+    target = account.lower() if spare else eos["account_id"].lower()
+    result = _ws_call(auth, version.v, "Skills/GetPlayerSkill v1", {"PlayerID": f"Epic|{target}|0"})
+    skills = parse_skills(result)
+    if spare and not skills:
+        raise SpareRefused(f"the servers gave the spare account no MMR for {account[:6]}")
+    name = stored.get(target, {}).get("name", "") if spare else reader_name
+    return Fetch(target, name, skills, datetime.now(timezone.utc))
 
 
 def save(fetch: Fetch, playlists, path: Path | None = None) -> tuple[str, int]:
