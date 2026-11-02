@@ -141,15 +141,19 @@ function Set-State([string]$Current) {
 
 # ---------- reading the launcher's current account ----------
 
-function Get-LastLoginFromLog {
-    # Last "OnLoginComplete" line in the current launcher log: account id + UTC timestamp.
+function Get-LastLoginFromLog([switch]$Any) {
+    # Last successful "OnLoginComplete" line in the current launcher log: account id + UTC timestamp.
+    # -Any: the last attempt, failed ones too (Ok = $false, Id = $null, Error = Epic's message), e.g. a saved
+    # login Epic no longer accepts ("Sorry the refresh token '...' is invalid").
     if (-not (Test-Path $LogPath)) { return $null }
-    $hit = Select-String -Path $LogPath -Pattern '^\[(\d{4})\.(\d\d)\.(\d\d)-(\d\d)\.(\d\d)\.(\d\d).*OnLoginComplete - 0 TRUE ([0-9a-f]{32})' |
+    $result = if ($Any) { 'TRUE|FALSE' } else { 'TRUE' }
+    $hit = Select-String -Path $LogPath -Pattern "^\[(\d{4})\.(\d\d)\.(\d\d)-(\d\d)\.(\d\d)\.(\d\d).*OnLoginComplete - 0 ($result)\s+([0-9a-f]{32})?(?:\s*errormessage=(.*?)(?:\s+errorcode=|$))?" |
         Select-Object -Last 1
     if (-not $hit) { return $null }
     $g = $hit.Matches[0].Groups
     $when = New-Object DateTime ([int]$g[1].Value), ([int]$g[2].Value), ([int]$g[3].Value), ([int]$g[4].Value), ([int]$g[5].Value), ([int]$g[6].Value), ([DateTimeKind]::Utc)
-    [pscustomobject]@{ Id = $g[7].Value; When = $when }
+    $ok = $g[7].Value -eq 'TRUE'
+    [pscustomobject]@{ Ok = $ok; Id = $(if ($ok) { $g[8].Value } else { $null }); When = $when; Error = $g[9].Value }
 }
 
 function Find-DisplayName([string]$Id) {
@@ -173,13 +177,13 @@ function Resolve-CurrentAccountId($Login) {
     foreach ($p in Get-Profiles) {
         try { if ((Unprotect-Text $p.Data.'RememberMe.Data') -eq $Login.Values['RememberMe.Data']) { return $p.Id } } catch {}
     }
-    # 2) Otherwise whichever is newer: the launcher log's last login, or our last switch.
-    $log = Get-LastLoginFromLog
+    # 2) Otherwise the launcher's last sign-in, if it came after our last switch and succeeded. Anything else
+    #    (Epic rejected the login, or no sign-in since the switch) means the settings file holds the launcher's
+    #    signed-out data, which must never be saved over an account's working login.
+    $log = Get-LastLoginFromLog -Any
     $state = Get-State
     $switchedAt = if ($state.SwitchedAt) { [DateTime]::Parse($state.SwitchedAt).ToUniversalTime() } else { [DateTime]::MinValue }
-    if ($log -and $log.When -ge $switchedAt) { return $log.Id }
-    if ($state.SwitchedAt) { return $state.Current }
-    if ($log) { return $log.Id }
+    if ($log -and $log.Ok -and $log.When -ge $switchedAt) { return $log.Id }
     $null
 }
 
@@ -289,13 +293,18 @@ if ($SwitchTo) {
             $deadline = (Get-Date).AddSeconds($WaitSignIn)
             while ((Get-Date) -lt $deadline) {
                 Start-Sleep -Milliseconds 1000
-                $login = Get-LastLoginFromLog
-                if ($login -and $login.Id -eq $SwitchTo -and $login.When -ge $started) { "Signed in as $name."; exit 0 }
+                $login = Get-LastLoginFromLog -Any
+                if (-not $login -or $login.When -lt $started) { continue }
+                if ($login.Ok -and $login.Id -eq $SwitchTo) { "Signed in as $name."; exit 0 }
+                if (-not $login.Ok -and $login.Error -match 'refresh token') {
+                    "Epic no longer accepts the saved sign-in for $name (it expired or was signed out). Sign in as $name in the launcher with ""Remember me"" ticked, then add the current account again."
+                    exit 3
+                }
             }
             if (-not (Test-WindowsInternet)) {
                 "The launcher didn't sign in as $name. Windows reports no internet (a VPN or tunnel adapter?), so Epic is probably on ""Connection error"": click Retry connection there."
             } else {
-                "The launcher didn't sign in as $name within $WaitSignIn seconds."
+                "The launcher didn't sign in as $name within $WaitSignIn seconds. If it's showing its sign-in page, the saved sign-in for $name has expired: sign in there with ""Remember me"" ticked, then add the current account again."
             }
             exit 3
         }
